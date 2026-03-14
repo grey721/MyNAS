@@ -1,0 +1,4 @@
+scripts/
+logs/
+checkpoints/
+trained_models/
