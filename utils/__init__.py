@@ -1,3 +1,3 @@
-from .utils import ConfigTool, SaveFile
+from utils.saver import ResultSaver, save_population_info, plot_population
 
-__all__ = [ConfigTool, SaveFile]
+__all__ = ['ResultSaver', 'save_population_info', 'plot_population']

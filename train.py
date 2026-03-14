@@ -11,64 +11,63 @@ import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.optim as optim
 
+from load_dataset.loaders import AugLevel, get_train_loader, get_test_loader, DEFAULT_DATA_ROOTS
 from template.tools import cal_flops_params
 from utils.logger import Logger
-from load_dataset.loaders import AugLevel, get_train_loader, get_test_loader, _DEFAULT_DATA_ROOTS
-
 
 parser = argparse.ArgumentParser('Training')
 
-# 运行环境
-parser.add_argument('--gpu',               type=int,   default=0)
-parser.add_argument('--seed',              type=int,   default=42)
-parser.add_argument('--use_subprocess',    action='store_true')
+# Runtime environment
+parser.add_argument('--gpu', type=int, default=0)
+parser.add_argument('--seed', type=int, default=42)
+parser.add_argument('--use_subprocess', action='store_true')
 
-# 数据
-parser.add_argument('--dataset',           type=str,   required=True,
-                    choices=list(_DEFAULT_DATA_ROOTS),
-                    help='数据集名称: cifar10 / cifar100 / imagenet')
-parser.add_argument('--batch_size',        type=int,   default=128)
-parser.add_argument('--num_workers',       type=int,   default=4)
-parser.add_argument('--aug_level',         type=str,   default='basic',
+# Data
+parser.add_argument('--dataset', type=str, required=True,
+                    choices=list(DEFAULT_DATA_ROOTS),
+                    help='Dataset name: cifar10 / cifar100 / imagenet')
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--num_workers', type=int, default=4)
+parser.add_argument('--aug_level', type=str, default='basic',
                     choices=['none', 'basic', 'strong'],
-                    help='训练数据增强强度: none / basic / strong')
+                    help='Training augmentation strength: none / basic / strong')
 
-# 模型
-parser.add_argument('--script_name',       type=str,   required=True)
-parser.add_argument('--dropout',           type=float, default=0.2)
+# Model
+parser.add_argument('--script_name', type=str, required=True)
+parser.add_argument('--dropout', type=float, default=0.2)
 parser.add_argument('--drop_connect_rate', type=float, default=0.2)
 
-# 训练
-parser.add_argument('--total_epochs',      type=int,   default=600)
-parser.add_argument('--warmup_epochs',     type=int,   default=10)
-parser.add_argument('--lr',                type=float, default=0.05)
-parser.add_argument('--warmup_lr',         type=float, default=0.0001,
-                    help='warmup 阶段起始学习率')
-parser.add_argument('--weight_decay',      type=float, default=4e-5)
-parser.add_argument('--momentum',          type=float, default=0.9)
-parser.add_argument('--grad_clip',         type=float, default=5.0)
+# Training
+parser.add_argument('--total_epochs', type=int, default=600)
+parser.add_argument('--warmup_epochs', type=int, default=10)
+parser.add_argument('--lr', type=float, default=0.05)
+parser.add_argument('--warmup_lr', type=float, default=0.0001,
+                    help='Initial learning rate during warmup')
+parser.add_argument('--weight_decay', type=float, default=4e-5)
+parser.add_argument('--momentum', type=float, default=0.9)
+parser.add_argument('--grad_clip', type=float, default=5.0)
 
 args = parser.parse_args()
 
 
 class Trainer:
     def __init__(self, net: nn.Module, args):
-        self.args    = args
+        self.args = args
         self.file_id = args.script_name
-        self.logger  = Logger(exp_name=f'Train_{self.file_id}')
+        self.logger = Logger(name=f'Train_{self.file_id}')
 
         self.train_loader, self.test_loader = self._build_loaders(args)
 
         cudnn.benchmark = True
 
-        self.net       = net.cuda()
+        self.net = net.cuda()
         self.criterion = nn.CrossEntropyLoss().cuda()
-        self.best_acc  = 0.0
+        self.best_acc = 0.0
 
         self.history = {
             'train_loss': [], 'test_loss': [],
-            'train_acc':  [], 'test_acc':  [],
-            'lr':         [],
+            'train_acc': [], 'test_acc': [],
+            'lr': [],
         }
 
         flops, params = cal_flops_params(self.net, input_size=self._input_size(args.dataset))
@@ -76,11 +75,11 @@ class Trainer:
         self.logger.save_config(args)
 
     def run(self) -> float:
-        args         = self.args
-        total_epoch  = args.total_epochs
+        args = self.args
+        total_epoch = args.total_epochs
         warmup_epoch = args.warmup_epochs
-        lr           = args.lr
-        warmup_lr    = args.warmup_lr
+        lr = args.lr
+        warmup_lr = args.warmup_lr
 
         optimizer = optim.SGD(
             self.net.parameters(),
@@ -144,7 +143,7 @@ class Trainer:
             optimizer.zero_grad(set_to_none=True)
 
             outputs = self.net(inputs)
-            loss    = self.criterion(outputs, labels)
+            loss = self.criterion(outputs, labels)
             loss.backward()
             if self.args.grad_clip > 0:
                 nn.utils.clip_grad_norm_(self.net.parameters(), self.args.grad_clip)
@@ -152,7 +151,7 @@ class Trainer:
 
             running_loss += loss.item() * labels.size(0)
             _, pred = outputs.detach().max(1)
-            total   += labels.size(0)
+            total += labels.size(0)
             correct += pred.eq(labels).sum().item()
 
         return running_loss / total, correct / total
@@ -166,12 +165,12 @@ class Trainer:
                 inputs = inputs.cuda(non_blocking=True)
                 labels = labels.cuda(non_blocking=True)
 
-                outputs   = self.net(inputs)
-                loss      = self.criterion(outputs, labels)
+                outputs = self.net(inputs)
+                loss = self.criterion(outputs, labels)
                 test_loss += loss.item() * labels.size(0)
-                _, pred   = outputs.max(1)
-                total    += labels.size(0)
-                correct  += pred.eq(labels).sum().item()
+                _, pred = outputs.max(1)
+                total += labels.size(0)
+                correct += pred.eq(labels).sum().item()
 
         acc = correct / total
         if acc > self.best_acc:
@@ -207,8 +206,12 @@ class Trainer:
 
 class Runner:
     """
-    use_subprocess=False（默认）：直接运行，调试友好，适合单模型训练。
-    use_subprocess=True：        子进程运行，显存完全释放，适合 NAS 批量评估。
+    Thin wrapper that optionally runs training in a subprocess.
+
+    use_subprocess=False (default): run in-process; easy to debug; ideal for
+                                    single-model training.
+    use_subprocess=True:            run in a child process; GPU memory is fully
+                                    released on exit; suitable for NAS batch eval.
     """
 
     def __init__(self, use_subprocess: bool = False):
@@ -251,7 +254,7 @@ class Runner:
 
 
 def _load_net(script_name: str, args) -> nn.Module:
-    """从 scripts/ 动态加载 Net 定义。"""
+    """Dynamically load the Net definition from scripts/."""
     module_name = f'scripts.{script_name}'
     sys.modules.pop(module_name, None)
     module = importlib.import_module(module_name)

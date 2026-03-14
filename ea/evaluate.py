@@ -1,125 +1,175 @@
+"""
+Evaluator: decodes each chromosome in a population into a network and
+computes its fitness metrics.
+
+Responsibilities
+----------------
+  ``Evaluator``      : manages data loading, FLOPs / Params counting,
+                       and fitness aggregation.
+  ``BaseProxy``      : computes a single zero-cost proxy score.
+  ``CompositeProxy`` : combines multiple proxy scores via weighted summation.
+
+Usage examples
+--------------
+    # Single proxy
+    from ea.proxy.naswot import NasWotProxy
+
+    evaluator = Evaluator('example_arch', 'cifar10', batch_size=128,
+                          proxy=NasWotProxy(batch_size=128))
+
+    # Different proxy
+    from ea.proxy.synflow import SynFlowProxy
+
+    evaluator = Evaluator('example_arch', 'cifar10', batch_size=128,
+                          proxy=SynFlowProxy())
+
+    # Composite proxy (weighted)
+    from ea.proxy import CompositeProxy
+    from ea.proxy.naswot  import NasWotProxy
+    from ea.proxy.synflow import SynFlowProxy
+
+    proxy = CompositeProxy(
+        proxies=[NasWotProxy(batch_size=128), SynFlowProxy()],
+        weights=[0.7, 0.3],
+    )
+    evaluator = Evaluator('example_arch', 'cifar10', batch_size=128, proxy=proxy)
+"""
+
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Iterator
+import itertools
 
 import numpy as np
-import torch
 import torch.nn as nn
 
-from archs.arch import Net
+from archs import load_arch
+from ea.proxy.base import BaseProxy
+from ea.proxy.naswot import NASWOT
 from load_dataset.loaders import AugLevel, get_nas_loader
 from template.tools import cal_flops_params
 
-
 _DATASET_META: dict[str, dict] = {
-    'cifar10':  {'input_shape': (1, 3, 32, 32),   'num_workers': 4},
-    'cifar100': {'input_shape': (1, 3, 32, 32),   'num_workers': 4},
+    'cifar10': {'input_shape': (1, 3, 32, 32), 'num_workers': 4},
+    'cifar100': {'input_shape': (1, 3, 32, 32), 'num_workers': 4},
     'imagenet': {'input_shape': (1, 3, 224, 224), 'num_workers': 32},
 }
 
+OBJ_NAMES = ('fitness', 'err', 'n_parameters', 'n_flops')
 
-def _logdet(K: np.ndarray) -> float:
-    _, ld = np.linalg.slogdet(K)
-    return float(ld)
-
-
-@contextmanager
-def _relu_hooks(net: nn.Module, K_buf: list[np.ndarray]) -> Iterator[None]:
-    """
-    为 net 中所有 ReLU 注册 forward hook，将 activation kernel 累加到 K_buf[0]。
-    使用 contextmanager 确保 hook 在退出时一定被移除。
-    """
-    handles = []
-
-    def _hook(module: nn.Module, inp: tuple, out: torch.Tensor) -> None:
-        x = inp[0] if isinstance(inp, tuple) else inp
-        x = x.view(x.size(0), -1)
-        binary = (x > 0).float()
-        K_buf[0] = (
-            K_buf[0]
-            + (binary @ binary.t()).cpu().numpy()
-            + ((1.0 - binary) @ (1.0 - binary.t())).cpu().numpy()
-        )
-
-    for module in net.modules():
-        if isinstance(module, nn.ReLU):
-            handles.append(module.register_forward_hook(_hook))
-
-    try:
-        yield   # 交给上下文管理器，退出后执行 finally
-    finally:
-        for h in handles:
-            h.remove()
+COL_FITNESS = 0
+COL_ERR = 1
+COL_PARAMS = 2
+COL_FLOPS = 3
 
 
 class Evaluator:
-    OBJ_NAMES = ('fitness', 'err', 'n_parameters', 'n_flops')
+    """
+    Population evaluator.
+
+    Parameters
+    ----------
+    arch_name:
+        Subdirectory name under ``archs/``, e.g. ``'example_arch'``.
+    dataset:
+        Dataset name, e.g. ``'cifar10'``.
+    batch_size:
+        Batch size used during NAS evaluation.
+    proxy:
+        A ``BaseProxy`` instance to use for scoring.
+        Instantiate and pass the proxy explicitly::
+
+            from ea.proxy.naswot  import NasWotProxy
+            from ea.proxy.synflow import SynFlowProxy
+
+            Evaluator(..., proxy=NasWotProxy(batch_size=128))
+            Evaluator(..., proxy=SynFlowProxy())
+
+        Defaults to ``NasWotProxy(batch_size=batch_size)``.
+    """
 
     def __init__(
-        self,
-        dataset: str,
-        batch_size: int,
-        # random_seed: int = 42,
+            self,
+            arch_name: str,
+            dataset: str,
+            batch_size: int,
+            proxy: BaseProxy | None = None,
     ) -> None:
         if dataset not in _DATASET_META:
             raise ValueError(
-                f'不支持的数据集: {dataset!r}，可选: {list(_DATASET_META)}'
+                f"Unsupported dataset: {dataset!r}. "
+                f"Available: {list(_DATASET_META)}"
             )
 
-        cfg = _DATASET_META[dataset]
+        # Load arch and extract the Net class.
+        arch_module = load_arch(arch_name)
+        self.Net = arch_module.Net
         self.dataset = dataset
-        self.batch_size_search = batch_size
-        self.input_shape: tuple[int, ...] = cfg['input_shape']
+        self.batch_size = batch_size
+        self.input_shape = _DATASET_META[dataset]['input_shape']
 
-        # generator = torch.Generator().manual_seed(random_seed)
+        # Default to NasWotProxy when no proxy is supplied.
+        self.proxy: BaseProxy = proxy if proxy is not None else NASWOT(batch_size=batch_size)
+
+        # Data loader wrapped in itertools.cycle so it never exhausts across generations.
+        cfg = _DATASET_META[dataset]
         loader = get_nas_loader(
             dataset=dataset,
             batch_size=batch_size,
-            aug_level=AugLevel.NONE,    # ZC-proxy 不需要数据增强
+            aug_level=AugLevel.NONE,
             num_workers=cfg['num_workers'],
             pin_memory=True,
-            # generator=generator,
         )
-        self._data_iter = iter(loader)
+        self._data_iter = itertools.cycle(loader)
 
-    def evaluate(self, population: list) -> np.ndarray:
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def evaluate(self, population) -> np.ndarray:
+        """
+        Evaluate an entire population.
+
+        Parameters
+        ----------
+        population:
+            List or ndarray of chromosomes, each with shape
+            ``(num_blocks, num_params)``.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(pop_size, 4)``, ``dtype=float32``.
+            Column order: ``[fitness, err, n_params, n_flops]``
+            (constants ``COL_FITNESS``, ``COL_ERR``, ``COL_PARAMS``, ``COL_FLOPS``).
+        """
         pop_size = len(population)
-        fitness_matrix = np.zeros((pop_size, len(self.OBJ_NAMES)), dtype=np.float32)
-
+        fitness_matrix = np.zeros((pop_size, len(OBJ_NAMES)), dtype=np.float32)
         for i, indi in enumerate(population):
-            net = Net(indi, self.dataset)
-            err, n_params, n_flops = self._evaluate(net)
-            fitness_matrix[i, 0] = self._cal_fitness(err, n_params, n_flops)
-            fitness_matrix[i, 1] = err
-            fitness_matrix[i, 2] = n_params
-            fitness_matrix[i, 3] = n_flops
+
+            net = self.Net(indi, self.dataset)
+
+            proxy_score = self._score(net)
+            n_flops, n_params = cal_flops_params(net, input_size=self.input_shape)
+           
+            fitness_matrix[i, COL_FITNESS] = proxy_score
+            fitness_matrix[i, COL_ERR] = -proxy_score  # err: lower is better
+            fitness_matrix[i, COL_PARAMS] = n_params
+            fitness_matrix[i, COL_FLOPS] = n_flops
 
         return fitness_matrix
-    
-    @staticmethod
-    def _cal_fitness(err: float, n_parameters: int, n_flops: int) -> float:
-        return -err
-    
-    def _evaluate(self, net: Net) -> tuple[float, int, int]:
-        net = net.cuda()
-        batch_size = self.batch_size_search
-        K_buf = [np.zeros((batch_size, batch_size), dtype=np.float64)]
 
-        x, target = next(self._data_iter)
-        x = x.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        try:
-            with _relu_hooks(net, K_buf):
-                net(x)
+    def _score(self, net: nn.Module) -> float:
+        """Fetch the next batch and compute the proxy score."""
+        batch = next(self._data_iter)  # (x, target) on CPU
+        return self.proxy.score(net, batch)
 
-            naswot_score = _logdet(K_buf[0])
-            err = -naswot_score  # err 越小 → 线性区域多样性越高
-
-            n_flops, n_params = cal_flops_params(net, input_size=self.input_shape)
-
-        finally:
-            del x, target
-
-        return err, n_params, n_flops
+    def __repr__(self) -> str:
+        return (
+            f"Evaluator(arch={self.Net.__module__}, "
+            f"dataset={self.dataset!r}, "
+            f"proxy={self.proxy!r})"
+        )

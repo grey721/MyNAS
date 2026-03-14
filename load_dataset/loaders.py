@@ -12,13 +12,11 @@ from torchvision import datasets, transforms
 from load_dataset.autoaugment import CIFAR10Policy, ImageNetPolicy
 from load_dataset.random_erasing import RandomErasing
 
-
-_DEFAULT_DATA_ROOTS = {
-    'cifar10':  '../datasets/CIFAR10_data',
+DEFAULT_DATA_ROOTS = {
+    'cifar10': '../datasets/CIFAR10_data',
     'cifar100': '../datasets/CIFAR100_data',
     'imagenet': '../datasets/imagenet/ILSVRC2012',
 }
-
 
 _NORM: dict[str, transforms.Normalize] = {
     'cifar10': transforms.Normalize(
@@ -38,20 +36,24 @@ _NORM: dict[str, transforms.Normalize] = {
 
 class AugLevel(Enum):
     """
-    训练增强的强度级别，传给 get_train_loader / get_nas_loader 等函数。
+    Training augmentation intensity level.
+
+    Passed to ``get_train_loader`` / ``get_nas_loader``.
 
     NONE
-        仅 ToTensor + Normalize。
-        适用场景：NAS 零成本代理评估（增强会干扰 kernel 矩阵评分稳定性）。
+        ToTensor + Normalize only.
+        Recommended for NAS zero-cost proxy evaluation, where augmentation
+        can destabilise kernel-matrix scoring.
 
     BASIC
-        CIFAR    : RandomCrop(32, padding=4) + RandomHorizontalFlip + Cutout
+        CIFAR    : RandomCrop(32, padding=4) + RandomHorizontalFlip + Cutout.
         ImageNet : RandomResizedCrop(224) + RandomHorizontalFlip
-                   + ColorJitter + RandomErasing
+                   + ColorJitter + RandomErasing.
 
     STRONG
-        BASIC 的全部增强 + AutoAugment policy（CIFAR10Policy / ImageNetPolicy）。
-        训练时间较长，但在 CIFAR-100 / ImageNet 上通常带来 0.5~1% 的精度提升。
+        All BASIC augmentations plus an AutoAugment policy
+        (CIFAR10Policy / ImageNetPolicy).  Typically yields 0.5–1 % accuracy
+        gains on CIFAR-100 / ImageNet at the cost of longer training.
     """
     NONE = 0
     BASIC = 1
@@ -60,7 +62,7 @@ class AugLevel(Enum):
 
 def _validate_dataset(dataset: str) -> None:
     if dataset not in _NORM:
-        raise ValueError(f'不支持的数据集: {dataset!r}，可选: {list(_NORM)}')
+        raise ValueError(f"Unsupported dataset: {dataset!r}. Available: {list(_NORM)}")
 
 
 class Cutout:
@@ -81,27 +83,28 @@ class Cutout:
 
 class BatchMixTransform:
     """
-    Batch 级数据增强，在训练循环中手动调用（不挂在 DataLoader collate 上）。
+    Batch-level data augmentation, applied manually inside the training loop
+    (not hooked into the DataLoader collate function).
 
-    支持三种模式
-    ------------
-    - 纯 Mixup   (mixup_alpha > 0, cutmix_alpha = 0)
-    - 纯 CutMix  (cutmix_alpha > 0, mixup_alpha = 0)
-    - 随机混用   (两者均 > 0，每 batch 各以 50% 概率选一种)
+    Supported modes
+    ---------------
+    - Pure Mixup   (mixup_alpha > 0, cutmix_alpha = 0)
+    - Pure CutMix  (cutmix_alpha > 0, mixup_alpha = 0)
+    - Random mix   (both > 0; each batch randomly selects one at 50/50)
 
-    与 Cutout 的关系
-    ----------------
-    推荐配置：
-      · 启用 CutMix  → 关闭 Cutout（传 use_cutout=False 给 get_train_loader）
-      · 仅启用 Mixup → Cutout 可保留
+    Interaction with Cutout
+    -----------------------
+    Recommended setup:
+      - With CutMix  -> disable Cutout (pass ``use_cutout=False`` to ``get_train_loader``).
+      - Mixup only   -> Cutout can remain enabled.
 
-    返回值与 CrossEntropyLoss 的兼容性
-    -----------------------------------
-    本变换将整型 label [B] 转为 soft one-hot float [B, C]。
-    PyTorch ≥ 1.10 的 nn.CrossEntropyLoss 可直接接受，无需修改 criterion。
+    Compatibility with CrossEntropyLoss
+    ------------------------------------
+    This transform converts integer labels ``[B]`` into soft one-hot floats
+    ``[B, C]``.  PyTorch >= 1.10 ``nn.CrossEntropyLoss`` accepts this directly.
 
-    用法示例
-    --------
+    Example
+    -------
         mixer = BatchMixTransform(num_classes=100, cutmix_alpha=1.0)
         for inputs, labels in train_loader:
             inputs, soft_labels = mixer(inputs.cuda(), labels.cuda())
@@ -115,7 +118,7 @@ class BatchMixTransform:
             cutmix_alpha: float = 0.0,
     ):
         if mixup_alpha == 0.0 and cutmix_alpha == 0.0:
-            raise ValueError('mixup_alpha 和 cutmix_alpha 至少有一个 > 0')
+            raise ValueError("At least one of mixup_alpha or cutmix_alpha must be > 0.")
         self.num_classes = num_classes
         self.mixup_alpha = mixup_alpha
         self.cutmix_alpha = cutmix_alpha
@@ -123,20 +126,18 @@ class BatchMixTransform:
     def __call__(
             self,
             images: torch.Tensor,  # [B, C, H, W]
-            labels: torch.Tensor,  # [B]，整型
+            labels: torch.Tensor,  # [B], integer
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """返回 (mixed_images [B,C,H,W], soft_labels [B, num_classes])。"""
+        """Return ``(mixed_images [B,C,H,W], soft_labels [B, num_classes])``."""
         soft_labels = torch.zeros(
             labels.size(0), self.num_classes,
             dtype=torch.float32, device=labels.device,
         ).scatter_(1, labels.view(-1, 1), 1.0)
 
         use_both = self.mixup_alpha > 0 and self.cutmix_alpha > 0
-        apply_cutmix = (use_both and torch.rand(1).item() < 0.5) or \
-                       (not use_both and self.cutmix_alpha > 0)
+        apply_cutmix = (use_both and torch.rand(1).item() < 0.5) or (not use_both and self.cutmix_alpha > 0)
 
-        return self._cutmix(images, soft_labels) if apply_cutmix \
-            else self._mixup(images, soft_labels)
+        return self._cutmix(images, soft_labels) if apply_cutmix else self._mixup(images, soft_labels)
 
     def _mixup(
             self, images: torch.Tensor, soft_labels: torch.Tensor,
@@ -164,7 +165,7 @@ class BatchMixTransform:
         mixed_images = images.clone()
         mixed_images[:, :, y1:y2, x1:x2] = images[perm, :, y1:y2, x1:x2]
 
-        # 用实际裁剪面积重算 lambda（边界 clip 后真实面积略小于名义值）
+        # Recompute lambda from actual crop area (boundary clipping reduces it slightly).
         lam_actual = 1.0 - (y2 - y1) * (x2 - x1) / (img_h * img_w)
         mixed_labels = lam_actual * soft_labels + (1.0 - lam_actual) * soft_labels[perm]
         return mixed_images, mixed_labels
@@ -176,18 +177,14 @@ def _build_train_transform(
         use_cutout: bool = False,
 ) -> transforms.Compose:
     """
-    aug_level = NONE
-        [ToTensor, Normalize]
+    Build the training transform pipeline for a given augmentation level.
 
-    aug_level = BASIC  (cifar)
-        [RandomCrop, HFlip, ToTensor, Normalize, Cutout?]
-    aug_level = BASIC  (imagenet)
-        [RandomResizedCrop, HFlip, ColorJitter, ToTensor, Normalize, RandomErasing]
-
-    aug_level = STRONG (cifar)
-        [RandomCrop, HFlip, CIFAR10Policy, ToTensor, Normalize, Cutout?]
-    aug_level = STRONG (imagenet)
-        [RandomResizedCrop, HFlip, ColorJitter, ImageNetPolicy, ToTensor, Normalize, RandomErasing]
+    NONE  : [ToTensor, Normalize]
+    BASIC  (cifar): [RandomCrop, HFlip, ToTensor, Normalize, Cutout?]
+    BASIC  (imagenet): [RandomResizedCrop, HFlip, ColorJitter, ToTensor, Normalize, RandomErasing]
+    STRONG (cifar): [RandomCrop, HFlip, CIFAR10Policy, ToTensor, Normalize, Cutout?]
+    STRONG (imagenet): [RandomResizedCrop, HFlip, ColorJitter, ImageNetPolicy,
+                        ToTensor, Normalize, RandomErasing]
     """
     normalize = _NORM[dataset]
     if aug_level == AugLevel.NONE:
@@ -199,7 +196,6 @@ def _build_train_transform(
             ])
         return transforms.Compose([transforms.ToTensor(), normalize])
 
-    # autoaugment
     if dataset == 'imagenet':
         ops = [
             transforms.RandomResizedCrop(224),
@@ -247,10 +243,10 @@ def _make_torchvision_dataset(
 ) -> tdata.Dataset:
     is_train = (split == 'train')
     if dataset == 'cifar10':
-        return datasets.CIFAR10(root=_DEFAULT_DATA_ROOTS[dataset], train=is_train, download=True, transform=transform)
+        return datasets.CIFAR10(root=DEFAULT_DATA_ROOTS[dataset], train=is_train, download=True, transform=transform)
     if dataset == 'cifar100':
-        return datasets.CIFAR100(root=_DEFAULT_DATA_ROOTS[dataset], train=is_train, download=True, transform=transform)
-    return datasets.ImageNet(root=_DEFAULT_DATA_ROOTS[dataset], split=split, transform=transform)
+        return datasets.CIFAR100(root=DEFAULT_DATA_ROOTS[dataset], train=is_train, download=True, transform=transform)
+    return datasets.ImageNet(root=DEFAULT_DATA_ROOTS[dataset], split=split, transform=transform)
 
 
 class _InfiniteRandomBatchSampler:
@@ -313,8 +309,13 @@ def get_nas_loader(
         generator=None,
 ) -> tdata.DataLoader:
     """
-    NAS 零成本代理专用 loader：无限随机单 batch，有放回采样。
-    用法：
+    Infinite random single-batch loader for NAS zero-cost proxy evaluation.
+
+    Samples are drawn with replacement so the iterator never exhausts,
+    regardless of how many generations the search runs.
+
+    Example
+    -------
         loader = get_nas_loader('cifar100', batch_size=128)
         it = iter(loader)
         for individual in population:
@@ -347,15 +348,18 @@ def get_debug_loaders(
         use_cutout: bool = False,
 ) -> tuple[tdata.DataLoader, tdata.DataLoader]:
     """
-    快速 Debug 专用：返回 (train_loader, test_loader)，
-    各自只包含约 sample_fraction 比例的随机子集。
+    Fast-debug loaders: return ``(train_loader, test_loader)`` each containing
+    a random subset of approximately ``sample_fraction`` of the full dataset.
 
     Parameters
     ----------
-    sample_fraction : 采样比例，默认 0.01（即 1% 数据，约 500 张 CIFAR-100）
-    aug_level       : 训练集的增强强度，测试集始终无增强
+    sample_fraction:
+        Fraction of data to include (default 0.01 ≈ 500 samples for CIFAR-100).
+    aug_level:
+        Augmentation level for the training split; the test split is always
+        evaluated without augmentation.
     """
-    assert 0.0 < sample_fraction <= 1.0, 'sample_fraction 需在 (0, 1]'
+    assert 0.0 < sample_fraction <= 1.0, 'sample_fraction must be in (0, 1]'
     _validate_dataset(dataset)
 
     train_data = _make_torchvision_dataset(

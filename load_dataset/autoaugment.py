@@ -2,9 +2,10 @@
 Taken from https://github.com/DeepVoltaire/AutoAugment/blob/master/autoaugment.py
 """
 
-from PIL import Image, ImageEnhance, ImageOps
-import numpy as np
 import random
+
+import numpy as np
+from PIL import Image, ImageEnhance, ImageOps
 
 
 class ImageNetPolicy(object):
@@ -20,6 +21,7 @@ class ImageNetPolicy(object):
         >>>     ImageNetPolicy(),
         >>>     transforms.ToTensor()])
     """
+
     def __init__(self, fillcolor=(128, 128, 128)):
         self.policies = [
             SubPolicy(0.4, "posterize", 8, 0.6, "rotate", 9, fillcolor),
@@ -53,7 +55,6 @@ class ImageNetPolicy(object):
             SubPolicy(0.8, "equalize", 8, 0.6, "equalize", 3, fillcolor)
         ]
 
-
     def __call__(self, img):
         policy_idx = random.randint(0, len(self.policies) - 1)
         return self.policies[policy_idx](img)
@@ -75,6 +76,7 @@ class CIFAR10Policy(object):
         >>>     CIFAR10Policy(),
         >>>     transforms.ToTensor()])
     """
+
     def __init__(self, fillcolor=(128, 128, 128)):
         self.policies = [
             SubPolicy(0.1, "invert", 7, 0.2, "contrast", 6, fillcolor),
@@ -108,7 +110,6 @@ class CIFAR10Policy(object):
             SubPolicy(0.7, "translateY", 9, 0.9, "autocontrast", 1, fillcolor)
         ]
 
-
     def __call__(self, img):
         policy_idx = random.randint(0, len(self.policies) - 1)
         return self.policies[policy_idx](img)
@@ -130,6 +131,7 @@ class SVHNPolicy(object):
         >>>     SVHNPolicy(),
         >>>     transforms.ToTensor()])
     """
+
     def __init__(self, fillcolor=(128, 128, 128)):
         self.policies = [
             SubPolicy(0.9, "shearX", 4, 0.2, "invert", 3, fillcolor),
@@ -162,7 +164,6 @@ class SVHNPolicy(object):
             SubPolicy(0.8, "shearY", 5, 0.7, "autocontrast", 3, fillcolor),
             SubPolicy(0.7, "shearX", 2, 0.1, "invert", 5, fillcolor)
         ]
-
 
     def __call__(self, img):
         policy_idx = random.randint(0, len(self.policies) - 1)
@@ -230,7 +231,6 @@ class SubPolicy(object):
         self.p2 = p2
         self.operation2 = func[operation2]
         self.magnitude2 = ranges[operation2][magnitude_idx2]
-
 
     def __call__(self, img):
         if random.random() < self.p1: img = self.operation1(img, self.magnitude1)

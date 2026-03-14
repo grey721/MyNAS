@@ -1,0 +1,451 @@
+# MyNAS — Evolutionary Neural Architecture Search
+
+A training-free, multi-objective evolutionary NAS framework built on
+zero-cost proxies.  The search runs entirely without gradient-based training,
+making it practical on a single GPU in minutes rather than days.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Project Structure](#project-structure)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+  - [1. Architecture Search](#1-architecture-search)
+  - [2. Training the Found Architecture](#2-training-the-found-architecture)
+- [Search Arguments](#search-arguments)
+- [Training Arguments](#training-arguments)
+- [Zero-Cost Proxies](#zero-cost-proxies)
+  - [Built-in Proxies](#built-in-proxies)
+  - [Adding a Custom Proxy](#adding-a-custom-proxy)
+  - [Composite Proxy](#composite-proxy)
+- [Adding a New Architecture](#adding-a-new-architecture)
+- [Output Files](#output-files)
+- [Design Notes](#design-notes)
+
+---
+
+## Overview
+
+MyNAS decouples the search phase from the training phase:
+
+```
+Search (zero-cost, seconds per generation)
+  ┌─────────────────────────────────────────────────────────────┐
+  │  Population of chromosomes  ──►  Zero-Cost Proxy score      │
+  │  (random init / crossover / mutation)   │                   │
+  │                                         ▼                   │
+  │  Dual-population NSGA-II  (P1: constraint-elite pool)       │
+  │                           (P2: Pareto-diversity pool)       │
+  └─────────────────────────────────────────────────────────────┘
+              │
+              ▼  best chromosome → scripts/<name>/
+Training (standard SGD, independent of search)
+  ┌─────────────────────────────────────────────────────────────┐
+  │  train.py loads Net from scripts/<name>/__init__.py         │
+  │  Cosine-annealing LR + optional warmup                      │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+Key design decisions:
+
+- **Direct-import proxies** — no registry, no magic; import whichever proxy
+  class you need and pass an instance to `Evaluator` or `Searcher`.
+- **Arch registry** — new architectures live in `archs/<name>/` and expose a
+  uniform interface; `ga.py` has zero knowledge of gene structure.
+- **Static / dynamic save modes** — if an arch implements `generate_code()`,
+  the found architecture is frozen to a self-contained `net.py`; otherwise a
+  lightweight wrapper decodes the chromosome at runtime.
+
+---
+
+## Project Structure
+
+```
+MyNAS/
+├── search.py                   Entry point for architecture search
+├── train.py                    Entry point for network training
+│
+├── archs/                      Architecture definitions
+│   ├── __init__.py             load_arch() factory + has_codegen() helper
+│   └── CSBConv/                Channel-Split Branch Convolution arch
+│       ├── __init__.py         Exposes Net / initialize_population / generate_code
+│       ├── genotypes/          Search-space definitions
+│       │   ├── __init__.py     get_search_space(dataset) router
+│       │   └── cifar.py        CIFAR search space (30 blocks × 6 genes)
+│       ├── modules/
+│       │   └── csb_conv.py     CSBConvBlock implementation
+│       └── net/
+│           ├── net.py          Dynamic Net (chromosome → nn.Module)
+│           ├── init.py         initialize_population + sample_gene
+│           └── codegen.py      generate_code (chromosome → static net.py)
+│
+├── ea/                         Evolutionary algorithm
+│   ├── ga.py                   Searcher — crossover / mutation / selection
+│   ├── evaluate.py             Evaluator — population fitness scoring
+│   ├── select.py               non_dominated_sort + crowding_distance
+│   ├── genotypes.py            (deprecated; use archs.<arch>.get_search_space)
+│   └── proxy/                  Zero-cost proxy subsystem
+│       ├── __init__.py         Public API + usage guide
+│       ├── base.py             BaseProxy ABC + registry + CompositeProxy
+│       ├── naswot.py           NAS-WOT proxy
+│       └── synflow.py          SynFlow proxy
+│
+├── load_dataset/               Data loading utilities
+│   ├── loaders.py              get_train/test/nas/debug_loader + AugLevel
+│   ├── autoaugment.py          CIFAR10Policy / ImageNetPolicy
+│   └── random_erasing.py       RandomErasing transform
+│
+├── utils/
+│   ├── __init__.py
+│   ├── logger.py               Logger — file + console logging, plot utilities
+│   └── utils.py                plot_population / save_population_info / ResultSaver
+│
+├── template/                   Reusable building blocks (independent of NAS)
+│   ├── func.py                 init_weight / Conv / SE / EfficientNet / EMA / losses
+│   ├── drop.py                 DropPath / DropBlock (Ross Wightman, Apache 2.0)
+│   └── tools.py                cal_flops_params
+│
+├── infotool/                   FLOPs / parameter counting backend
+│
+├── scripts/                    Generated by search.py; one subdir per result
+│   └── <arch_name>/
+│       ├── __init__.py         Net entry point (static re-export or dynamic wrapper)
+│       ├── net.py              (static mode only) frozen network definition
+│       ├── chromosome.json     Raw chromosome
+│       ├── search_info.json    Search metadata
+│       ├── train.sh            Ready-to-run training script
+│       └── README.txt          Human-readable summary
+│
+├── logs/                       Experiment logs (auto-created)
+└── trained_models/             Saved checkpoints (auto-created)
+```
+
+---
+
+## Requirements
+
+```
+Python  >= 3.10
+PyTorch >= 1.10
+torchvision
+numpy
+pandas
+matplotlib
+```
+
+Install dependencies:
+
+```bash
+pip install torch torchvision numpy pandas matplotlib
+```
+
+Datasets are expected under `../datasets/` by default (see
+`load_dataset/loaders.py` → `_DEFAULT_DATA_ROOTS`).  Override by editing
+that dict or by symlinking.
+
+---
+
+## Quick Start
+
+### 1. Architecture Search
+
+```bash
+python search.py \
+    --arch        example_arch \
+    --dataset     cifar10 \
+    --proxy       naswot \
+    --p1_size     50 \
+    --p2_size     50 \
+    --num_generations 50 \
+    --batch_size_search 32 \
+    --params_max  0.5 \
+    --file_name   Best_architecture
+```
+
+The search writes results to `scripts/Best_architecture/`.
+
+#### Search with a different proxy
+
+```bash
+python search.py --arch example_arch --dataset cifar100 --proxy synflow
+```
+
+#### Unconstrained search
+
+Omit `--params_max` / `--flops_max` for an unconstrained Pareto front.
+
+---
+
+### 2. Training the Found Architecture
+
+```bash
+bash scripts/Best_architecture/train.sh
+```
+
+Or manually:
+
+```bash
+python train.py \
+    --script_name        Best_architecture \
+    --dataset            cifar10 \
+    --total_epochs       600 \
+    --warmup_epochs      10 \
+    --lr                 0.05 \
+    --weight_decay       4e-5 \
+    --aug_level          basic \
+    --dropout            0.2 \
+    --drop_connect_rate  0.2
+```
+
+---
+
+## Search Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--arch` | *(required)* | Arch name matching `archs/<arch>/` directory |
+| `--dataset` | *(required)* | Dataset: `cifar10` / `cifar100` / `imagenet` |
+| `--proxy` | `naswot` | Zero-cost proxy name: `naswot` / `synflow` (resolved in `search.py`) |
+| `--p1_size` | `50` | P1 constraint-elite pool size |
+| `--p2_size` | `50` | P2 Pareto-diversity pool size |
+| `--num_generations` | `50` | Number of evolutionary generations |
+| `--crossover_rate` | `0.8` | Crossover probability |
+| `--mutation_rate` | `0.2` | Per-gene mutation probability |
+| `--batch_size_search` | `128` | Batch size for proxy evaluation |
+| `--params_max` | `None` | Parameter count upper bound (M) |
+| `--params_min` | `None` | Parameter count lower bound (M) |
+| `--flops_max` | `None` | FLOPs upper bound (M) |
+| `--flops_min` | `None` | FLOPs lower bound (M) |
+| `--random_seed` | `42` | Global random seed |
+| `--file_name` | `Best_architecture` | Output script name |
+
+---
+
+## Training Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--script_name` | *(required)* | Subdirectory under `scripts/` to load |
+| `--dataset` | *(required)* | Dataset name |
+| `--gpu` | `0` | GPU device index |
+| `--batch_size` | `128` | Training batch size |
+| `--total_epochs` | `600` | Total training epochs |
+| `--warmup_epochs` | `10` | Linear LR warmup epochs |
+| `--lr` | `0.05` | Peak learning rate |
+| `--warmup_lr` | `0.0001` | Initial warmup learning rate |
+| `--weight_decay` | `4e-5` | SGD weight decay |
+| `--momentum` | `0.9` | SGD momentum |
+| `--grad_clip` | `5.0` | Gradient norm clip threshold (`0` = disabled) |
+| `--dropout` | `0.2` | Classifier head dropout |
+| `--drop_connect_rate` | `0.2` | DropPath ceiling (linearly scaled per epoch) |
+| `--aug_level` | `basic` | Augmentation: `none` / `basic` / `strong` |
+| `--use_subprocess` | `False` | Run training in a child process (frees GPU on exit) |
+
+---
+
+## Zero-Cost Proxies
+
+Proxies are plain Python classes.  Import the one you want and instantiate it
+directly — there is no registry and no string lookup.
+
+### Built-in Proxies
+
+| Class | Module | Paper | Score signal |
+|---|---|---|---|
+| `NasWotProxy` | `ea/proxy/naswot.py` | Mellor et al., ICML 2021 | log\|K\|: log-det of ReLU activation kernel |
+| `SynFlowProxy` | `ea/proxy/synflow.py` | Tanaka et al., NeurIPS 2020 | Σ\|θ ⊙ ∂R/∂θ\|, data-free synaptic flow |
+
+### Usage
+
+**Single proxy**:
+
+```python
+from ea.proxy.naswot import NASWOT
+from ea.proxy.synflow import SynFlow
+from ea.evaluate import Evaluator
+
+evaluator = Evaluator('example_arch', 'cifar10', batch_size=128,
+                      proxy=NASWOT(batch_size=128))
+
+# or
+evaluator = Evaluator('example_arch', 'cifar10', batch_size=128,
+                      proxy=SynFlow())
+```
+
+**Composite proxy (weighted sum)**:
+
+```python
+from ea.proxy import CompositeProxy
+from ea.proxy.naswot import NASWOT
+from ea.proxy.synflow import SynFlow
+from ea.evaluate import Evaluator
+
+proxy = CompositeProxy(
+  proxies=[NASWOT(batch_size=128), SynFlow()],
+  weights=[0.7, 0.3],  # auto-normalised; equal weights if omitted
+)
+evaluator = Evaluator('example_arch', 'cifar10', batch_size=128, proxy=proxy)
+```
+
+**From the CLI** (`search.py` maps the `--proxy` string to an instance
+locally; this is application-level glue, not a registry):
+
+```bash
+python search.py --arch example_arch --dataset cifar10 --proxy naswot
+python search.py --arch example_arch --dataset cifar10 --proxy synflow
+```
+
+### Adding a Custom Proxy
+
+**Step 1** — Create `ea/proxy/grad_norm.py`:
+
+```python
+import torch.nn as nn
+from ea.proxy.base import BaseProxy
+
+class GradNormProxy(BaseProxy):
+    """Gradient-norm proxy: sum of squared parameter gradients."""
+
+    def _compute(
+        self,
+        net: nn.Module,
+        batch: tuple[torch.Tensor, torch.Tensor],
+    ) -> float:
+        x, target = batch
+        net.zero_grad()
+        loss = nn.CrossEntropyLoss()(net(x), target)
+        loss.backward()
+        score = sum(
+            p.grad.norm().item() ** 2
+            for p in net.parameters()
+            if p.grad is not None
+        )
+        net.zero_grad()
+        return score   # higher is better
+```
+
+**Step 2** — Use it directly wherever needed:
+
+```python
+from ea.proxy.grad_norm import GradNormProxy
+from ea.evaluate        import Evaluator
+
+evaluator = Evaluator('example_arch', 'cifar10', batch_size=128,
+                      proxy=GradNormProxy())
+```
+
+**Step 3 (optional)** — To support `--proxy grad_norm` from the CLI, add
+one line to `_build_proxy()` in `search.py`:
+
+```python
+_PROXY_MAP: dict[str, BaseProxy] = {
+    'naswot':    NasWotProxy(batch_size=batch_size),
+    'synflow':   SynFlowProxy(),
+    'grad_norm': GradNormProxy(),   # add this line
+}
+```
+
+No other files need to change.
+## Adding a New Architecture
+
+Create a subdirectory `archs/<your_arch>/` and expose these symbols from its
+`__init__.py`:
+
+| Symbol | Signature | Purpose |
+|---|---|---|
+| `Net` | `Net(individual, dataset, dropout, drop_connect_rate)` | Decode chromosome → `nn.Module` |
+| `initialize_population` | `(search_space, pop_size) → ndarray` | Random population init |
+| `get_search_space` | `(dataset) → dict` | Return search-space dict |
+| `generate_code` | `(individual, dataset) → str` *(optional)* | Freeze chromosome → `net.py` source |
+
+**Search-space dict format:**
+
+```python
+{
+    'names': ['block_0', 'block_1', ...],    # ordered block list
+    'block_0': [
+        [0, 0.25, 0.5, 1.0],   # gene 0 candidates
+        [3, 4, 6],              # gene 1 candidates
+        ...                     # one list per gene slot
+        [base_channels],        # second-to-last: base channel count
+        stride,                 # last: stride (int)
+    ],
+    ...
+}
+```
+
+If `generate_code` is absent, `ResultSaver` automatically falls back to
+*dynamic mode*: the chromosome is saved as `chromosome.json` and decoded at
+training time via a thin wrapper.
+
+---
+
+## Output Files
+
+After a successful search, `scripts/<file_name>/` contains:
+
+```
+scripts/<file_name>/
+├── __init__.py       Net entry point (identical external interface in both modes)
+├── chromosome.json   Raw chromosome array
+├── search_info.json  Search metadata (proxy, objectives, save mode, ...)
+├── train.sh          Ready-to-run training script
+├── README.txt        Human-readable result summary
+└── net.py            (static mode only) frozen network definition
+```
+
+`search_info.json` example:
+
+```json
+{
+  "name": "Best_architecture",
+  "arch": "example_arch",
+  "dataset": "cifar10",
+  "net_mode": "static",
+  "saved_at": "2025-01-01 12:00:00",
+  "objectives": {
+    "error":    0.0523,
+    "params_M": 0.48,
+    "flops_M":  182.4
+  },
+  "proxy": "NasWotProxy(batch_size=128)",
+  "generations": 100
+}
+```
+
+---
+
+## Design Notes
+
+### Dual-population selection
+
+The searcher maintains two independent pools:
+
+- **P1** (constraint-elite) — feasibility-first: individuals satisfying all
+  constraints are selected by non-dominated rank, then by fitness.  Infeasible
+  individuals fill remaining slots ordered by constraint-violation penalty.
+- **P2** (Pareto-diversity) — standard NSGA-II: non-dominated sort + crowding
+  distance, no explicit constraint handling.
+
+Both pools exchange offspring each generation, allowing P1 to exploit
+constraint-feasible regions while P2 maintains diversity across the Pareto front.
+
+### Static vs dynamic save mode
+
+| | Static | Dynamic |
+|---|---|---|
+| Requires | `generate_code()` in arch | Nothing extra |
+| `net.py` written | Yes | No |
+| Runtime dependency on `archs/` | No | Yes |
+| Re-uses latest decode logic | No | Yes |
+
+Both modes expose the same external `Net(dropout, drop_connect_rate)` signature
+so `train.py` requires no modification.
+
+### Score convention
+
+All proxies return **higher-is-better** floats.  The `Evaluator` stores the
+negated value in column `COL_ERR` (lower-is-better) for multi-objective
+selection.  Never negate a proxy score twice.

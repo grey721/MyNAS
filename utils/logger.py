@@ -1,92 +1,203 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
 from datetime import datetime
 
 import matplotlib
-matplotlib.use('Agg')  # 无显示器环境
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import numpy as np
 
-from utils.utils import plot_population, save_population_info
+matplotlib.use('Agg')
+
+import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from utils.saver import plot_population, save_population_info
 
 
 class Logger:
-    def __init__(self, exp_name="Experiment", base_dir="logs", log_to_console=True, debug=False):
-        # 实验目录
-        if debug:
-            self.project_name = exp_name
-        else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.project_name = f"{exp_name}_{timestamp}"
+    """
+    Experiment logger.
 
-        self.exp_dir = os.path.join(base_dir, self.project_name)
+    Parameters
+    ----------
+    name      : Experiment name prefix, e.g. 'NAS_CSBConv_cifar10'.
+    log_dir   : Root directory for logs. Default: 'logs'.
+    console   : Whether to also print to stdout.
+    overwrite : If True, the run directory is not timestamped
+                (useful for debugging or resuming a run).
+    """
+
+    PLOTS_DIR = 'plots'
+    POPULATION_DIR = 'population'
+
+    def __init__(
+            self,
+            name: str = 'Experiment',
+            log_dir: str = 'logs',
+            console: bool = True,
+            overwrite: bool = False,
+    ) -> None:
+        if overwrite:
+            self.run_name = name
+        else:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.run_name = f'{name}_{timestamp}'
+
+        self.exp_dir = os.path.join(log_dir, self.run_name)
         os.makedirs(self.exp_dir, exist_ok=True)
 
-        self.log_file = os.path.join(self.exp_dir, f"{exp_name}.log")
+        log_file = os.path.join(self.exp_dir, 'run.log')
+        self._logger = logging.getLogger(self.run_name)
+        self._logger.setLevel(logging.INFO)
+        self._logger.handlers.clear()
 
-        # logging 初始化
-        self.logger = logging.getLogger(self.project_name)
-        self.logger.setLevel(logging.INFO)
-        self.logger.handlers.clear()
-        fmt = logging.Formatter("%(levelname)-8s   %(asctime)s | %(message)s", "%H:%M:%S")
-
-        fh = logging.FileHandler(self.log_file, encoding="utf-8")
+        fmt = logging.Formatter(
+            '%(levelname)-8s   %(asctime)s | %(message)s',
+            datefmt='%H:%M:%S',
+        )
+        fh = logging.FileHandler(log_file, encoding='utf-8')
         fh.setFormatter(fmt)
-        self.logger.addHandler(fh)
+        self._logger.addHandler(fh)
 
-        if log_to_console:
+        if console:
             ch = logging.StreamHandler()
             ch.setFormatter(fmt)
-            self.logger.addHandler(ch)
+            self._logger.addHandler(ch)
 
     # ------------------------------------------------------------------
-    # 基础日志接口
+    # Basic logging interface
     # ------------------------------------------------------------------
 
-    def info(self, msg):    self.logger.info(msg)
-    def warning(self, msg): self.logger.warning(msg)
-    def error(self, msg):   self.logger.error(msg)
-    def debug(self, msg):   self.logger.debug(msg)
+    def info(self, msg: str) -> None:
+        self._logger.info(msg)
 
-    def save_config(self, args):
+    def warning(self, msg: str) -> None:
+        self._logger.warning(msg)
+
+    def error(self, msg: str) -> None:
+        self._logger.error(msg)
+
+    def debug(self, msg: str) -> None:
+        self._logger.debug(msg)
+
+    # ------------------------------------------------------------------
+    # Config persistence
+    # ------------------------------------------------------------------
+
+    def save_config(self, args) -> None:
+        """Serialize an argparse.Namespace or dict to config.json."""
         path = os.path.join(self.exp_dir, 'config.json')
+        data = vars(args) if hasattr(args, '__dict__') else dict(args)
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump(vars(args), f, indent=4, ensure_ascii=False)
-        self.info(f"Config saved → {path}")
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        self.info(f'Config saved -> {path}')
 
     # ------------------------------------------------------------------
-    # NAS 种群可视化（原有功能保留）
+    # NAS population visualisation & data persistence
     # ------------------------------------------------------------------
 
-    def plot_pop(self, p1, p2, generation):
-        out = os.path.join(self.exp_dir, 'pic')
-        plot_population(p1, p2, generation=generation, save_dir=out)
-        self.info(f'Population plot saved → {out}')
+    def plot_pop(
+            self,
+            p1_fitness: np.ndarray,
+            p2_fitness: np.ndarray,
+            generation: int,
+    ) -> None:
+        out_dir = os.path.join(self.exp_dir, self.PLOTS_DIR)
+        plot_population(p1_fitness, p2_fitness, save_dir=out_dir, generation=generation)
+        self.info(f'Population scatter plot saved -> {out_dir}')
 
-    def save_population(self, population, fitness_matrix, filename, generation=None):
-        out = os.path.join(self.exp_dir, 'population')
-        save_population_info(population=population, fitness_matrix=fitness_matrix,
-                             filename=filename, output_dir=out, generation=generation)
-        self.info(f'Population info saved → {out}')
+    def save_population(
+            self,
+            population: np.ndarray,
+            fitness_matrix: np.ndarray,
+            label: str,
+            generation: int | None = None,
+    ) -> None:
+        out_dir = os.path.join(self.exp_dir, self.POPULATION_DIR)
+        save_population_info(
+            population=population,
+            fitness_matrix=fitness_matrix,
+            label=label,
+            generation=generation,
+            output_dir=out_dir,
+        )
+        self.info(f'Population data saved -> {out_dir}')
 
     # ------------------------------------------------------------------
-    # 训练曲线可视化
+    # Training history: data persistence (decoupled from plotting)
     # ------------------------------------------------------------------
 
-    def plot_training(self, history: dict, title: str = 'Training Curves', filename: str = 'training_curves.png'):
+    def save_history(self, history: dict) -> None:
         """
-        根据 history 字典绘制训练曲线并保存。
+        Write training history to a CSV file and a JSON summary.
 
-        history 格式：
+        Each call overwrites the previous files, so resuming a run
+        always produces a complete and up-to-date record.
+
+        Expected history format
+        -----------------------
         {
             'train_loss': [...], 'test_loss': [...],
             'train_acc':  [...], 'test_acc':  [...],
-            'lr':         [...]
+            'lr':         [...],
         }
         """
-        out_dir = os.path.join(self.exp_dir, 'pic')
+        n_epochs = len(history['train_loss'])
+        if n_epochs == 0:
+            return
+
+        # --- CSV: one row per epoch ---
+        df = pd.DataFrame({
+            'epoch': list(range(1, n_epochs + 1)),
+            'train_loss': history['train_loss'],
+            'test_loss': history['test_loss'],
+            'train_acc': [round(a, 6) for a in history['train_acc']],
+            'test_acc': [round(a, 6) for a in history['test_acc']],
+            'lr': history['lr'],
+        })
+        csv_path = os.path.join(self.exp_dir, 'training_history.csv')
+        df.to_csv(csv_path, index=False)
+
+        # --- JSON summary ---
+        best_acc_idx = int(np.argmax(history['test_acc']))
+        best_loss_idx = int(np.argmin(history['test_loss']))
+        summary = {
+            'total_epochs': n_epochs,
+            'best_acc': round(history['test_acc'][best_acc_idx], 6),
+            'best_acc_epoch': best_acc_idx + 1,
+            'best_loss': round(history['test_loss'][best_loss_idx], 6),
+            'best_loss_epoch': best_loss_idx + 1,
+            'final_train_acc': round(history['train_acc'][-1], 6),
+            'final_test_acc': round(history['test_acc'][-1], 6),
+            'final_lr': history['lr'][-1],
+        }
+        summary_path = os.path.join(self.exp_dir, 'training_summary.json')
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=4)
+
+    # ------------------------------------------------------------------
+    # Training curve visualisation
+    # ------------------------------------------------------------------
+
+    def plot_training(
+            self,
+            history: dict,
+            title: str = 'Training Curves',
+            filename: str = 'training_curves.png',
+    ) -> None:
+        """
+        Plot training curves and save the figure.
+
+        Raw data is persisted first via save_history() so that
+        the CSV/JSON are written even if plotting fails.
+        """
+        # Persist raw data before plotting (decoupled: data is safe even if plot fails)
+        self.save_history(history)
+
+        out_dir = os.path.join(self.exp_dir, self.PLOTS_DIR)
         os.makedirs(out_dir, exist_ok=True)
         save_path = os.path.join(out_dir, filename)
 
@@ -94,12 +205,12 @@ class Logger:
 
         fig = plt.figure(figsize=(15, 4))
         fig.suptitle(title, fontsize=13, fontweight='bold', y=1.01)
-        gs  = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
+        gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
 
-        # --- Loss ---
+        # Loss
         ax1 = fig.add_subplot(gs[0])
-        ax1.plot(epochs, history['train_loss'], label='Train', color='steelblue',  linewidth=1.5)
-        ax1.plot(epochs, history['test_loss'],  label='Test',  color='tomato',     linewidth=1.5)
+        ax1.plot(epochs, history['train_loss'], label='Train', color='steelblue', linewidth=1.5)
+        ax1.plot(epochs, history['test_loss'], label='Test', color='tomato', linewidth=1.5)
         ax1.set_title('Loss')
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Loss')
@@ -107,22 +218,22 @@ class Logger:
         ax1.grid(True, linestyle='--', alpha=0.5)
         self._mark_best(ax1, epochs, history['test_loss'], mode='min', color='tomato')
 
-        # --- Accuracy ---
+        # Accuracy
         ax2 = fig.add_subplot(gs[1])
-        train_acc_pct = [a * 100 for a in history['train_acc']]
-        test_acc_pct  = [a * 100 for a in history['test_acc']]
-        ax2.plot(epochs, train_acc_pct, label='Train', color='steelblue', linewidth=1.5)
-        ax2.plot(epochs, test_acc_pct,  label='Test',  color='tomato',    linewidth=1.5)
+        train_pct = [a * 100 for a in history['train_acc']]
+        test_pct = [a * 100 for a in history['test_acc']]
+        ax2.plot(epochs, train_pct, label='Train', color='steelblue', linewidth=1.5)
+        ax2.plot(epochs, test_pct, label='Test', color='tomato', linewidth=1.5)
         ax2.set_title('Accuracy')
         ax2.set_xlabel('Epoch')
         ax2.set_ylabel('Acc (%)')
         ax2.legend()
         ax2.grid(True, linestyle='--', alpha=0.5)
-        best_acc = self._mark_best(ax2, epochs, test_acc_pct, mode='max', color='tomato')
+        best_acc = self._mark_best(ax2, epochs, test_pct, mode='max', color='tomato')
         if best_acc is not None:
-            ax2.set_title(f'Accuracy  (best test: {best_acc:.2f}%)')
+            ax2.set_title(f'Accuracy  (best: {best_acc:.2f}%)')
 
-        # --- Learning Rate ---
+        # Learning rate
         ax3 = fig.add_subplot(gs[2])
         ax3.plot(epochs, history['lr'], color='mediumseagreen', linewidth=1.5)
         ax3.set_title('Learning Rate')
@@ -134,37 +245,101 @@ class Logger:
         plt.tight_layout()
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
+        self.info(f'Training curves saved -> {save_path}')
 
-        self.info(f'Training curves saved → {save_path}')
+    def plot_training_realtime(
+            self,
+            history: dict,
+            epoch: int,
+            total_epochs: int,
+            interval: int = 10,
+            title: str = 'Training Curves',
+    ) -> None:
+        """
+        Save a plot every `interval` epochs and keep the CSV in sync.
 
-    def plot_training_realtime(self, history: dict, epoch: int,
-                               total_epochs: int, interval: int = 10,
-                               title: str = 'Training Curves'):
+        The CSV is overwritten on every call (always complete and resumable);
+        plots are generated only at multiples of `interval` to reduce I/O.
         """
-        每隔 interval 个 epoch 自动保存一次曲线（实时更新用）。
-        最终图命名为 training_curves.png，中间图命名为 training_curves_eXXX.png。
-        """
+        # Always update CSV (available for real-time inspection)
+        self.save_history(history)
+
+        # Generate plot only at the specified interval
         if epoch % interval == 0 or epoch == total_epochs:
-            filename = ('training_curves.png' if epoch == total_epochs
-                        else f'training_curves_e{epoch:04d}.png')
-            self.plot_training(history, title=title, filename=filename)
+            is_final = (epoch == total_epochs)
+            fname = 'training_curves.png' if is_final else f'training_curves_e{epoch:04d}.png'
+            # Call internal plot helper to avoid writing CSV a second time
+            self._plot_and_save(history, title=title, filename=fname)
+
+    def _plot_and_save(
+            self,
+            history: dict,
+            title: str,
+            filename: str,
+    ) -> None:
+        """Plot and save without writing data (used internally by plot_training_realtime)."""
+        out_dir = os.path.join(self.exp_dir, self.PLOTS_DIR)
+        os.makedirs(out_dir, exist_ok=True)
+        save_path = os.path.join(out_dir, filename)
+
+        epochs = range(1, len(history['train_loss']) + 1)
+        fig = plt.figure(figsize=(15, 4))
+        fig.suptitle(title, fontsize=13, fontweight='bold', y=1.01)
+        gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
+
+        ax1 = fig.add_subplot(gs[0])
+        ax1.plot(epochs, history['train_loss'], label='Train', color='steelblue', linewidth=1.5)
+        ax1.plot(epochs, history['test_loss'], label='Test', color='tomato', linewidth=1.5)
+        ax1.set_title('Loss');
+        ax1.set_xlabel('Epoch');
+        ax1.set_ylabel('Loss')
+        ax1.legend();
+        ax1.grid(True, linestyle='--', alpha=0.5)
+        self._mark_best(ax1, epochs, history['test_loss'], mode='min', color='tomato')
+
+        ax2 = fig.add_subplot(gs[1])
+        train_pct = [a * 100 for a in history['train_acc']]
+        test_pct = [a * 100 for a in history['test_acc']]
+        ax2.plot(epochs, train_pct, label='Train', color='steelblue', linewidth=1.5)
+        ax2.plot(epochs, test_pct, label='Test', color='tomato', linewidth=1.5)
+        best_acc = self._mark_best(ax2, epochs, test_pct, mode='max', color='tomato')
+        title_acc = f'Accuracy  (best: {best_acc:.2f}%)' if best_acc else 'Accuracy'
+        ax2.set_title(title_acc);
+        ax2.set_xlabel('Epoch');
+        ax2.set_ylabel('Acc (%)')
+        ax2.legend();
+        ax2.grid(True, linestyle='--', alpha=0.5)
+
+        ax3 = fig.add_subplot(gs[2])
+        ax3.plot(epochs, history['lr'], color='mediumseagreen', linewidth=1.5)
+        ax3.set_title('Learning Rate');
+        ax3.set_xlabel('Epoch');
+        ax3.set_ylabel('LR')
+        ax3.set_yscale('log');
+        ax3.grid(True, linestyle='--', alpha=0.5)
+
+        plt.tight_layout()
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        self.info(f'Training curves saved -> {save_path}')
 
     # ------------------------------------------------------------------
-    # 内部工具
+    # Internal helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _mark_best(ax, epochs, values, mode='min', color='tomato', markersize=6):
-        """在最优点打星标并标注数值，返回最优值。"""
+        """Mark the best point on a plot axis and annotate its value."""
         if not values:
             return None
         best_idx = int(np.argmin(values) if mode == 'min' else np.argmax(values))
         best_val = values[best_idx]
-        best_ep  = list(epochs)[best_idx]
-        ax.scatter(best_ep, best_val, color=color, zorder=5,
-                   marker='*', s=markersize ** 2)
-        ax.annotate(f'{best_val:.3f}',
-                    xy=(best_ep, best_val),
-                    xytext=(6, 6), textcoords='offset points',
-                    fontsize=7.5, color=color)
+        best_ep = list(epochs)[best_idx]
+        ax.scatter(best_ep, best_val, color=color, zorder=5, marker='*', s=markersize ** 2)
+        ax.annotate(
+            f'{best_val:.3f}',
+            xy=(best_ep, best_val),
+            xytext=(6, 6), textcoords='offset points',
+            fontsize=7.5, color=color,
+        )
         return best_val
