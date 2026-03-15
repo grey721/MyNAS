@@ -23,14 +23,14 @@ class Logger:
 
     Parameters
     ----------
-    name      : Experiment name prefix, e.g. 'NAS_CSBConv_cifar10'.
-    log_dir   : Root directory for logs. Default: 'logs'.
+    name      : Experiment name prefix, e.g. 'Train_Best_architecture'.
+    log_dir   : Root directory for logs.  Default: 'logs'.
     console   : Whether to also print to stdout.
     overwrite : If True, the run directory is not timestamped
                 (useful for debugging or resuming a run).
     """
 
-    PLOTS_DIR = 'plots'
+    PLOTS_DIR      = 'plots'
     POPULATION_DIR = 'population'
 
     def __init__(
@@ -127,56 +127,84 @@ class Logger:
         self.info(f'Population data saved -> {out_dir}')
 
     # ------------------------------------------------------------------
-    # Training history: data persistence (decoupled from plotting)
+    # Training history: data persistence
     # ------------------------------------------------------------------
 
     def save_history(self, history: dict) -> None:
         """
-        Write training history to a CSV file and a JSON summary.
+        Write complete training history to disk as CSV and JSON.
 
-        Each call overwrites the previous files, so resuming a run
-        always produces a complete and up-to-date record.
+        Called once at the end of training (including interrupted / failed
+        runs).  Each call overwrites the previous files, so the output is
+        always a complete, consistent snapshot of whatever epochs were run.
 
-        Expected history format
-        -----------------------
-        {
-            'train_loss': [...], 'test_loss': [...],
-            'train_acc':  [...], 'test_acc':  [...],
-            'lr':         [...],
-        }
+        Output files
+        ------------
+        training_history.csv
+            Per-epoch table for direct use in visualisation / comparison
+            scripts.  Columns:
+
+                epoch        — 1-based epoch index
+                train_loss   — mean cross-entropy on the training set
+                test_loss    — mean cross-entropy on the test set
+                train_acc    — training accuracy  [0, 1]
+                test_acc     — test accuracy      [0, 1]
+                lr           — learning rate at the start of the epoch
+
+        training_summary.json
+            Scalar summary for quick inspection.  Fields:
+
+                best_acc         — highest test_acc observed
+                best_acc_epoch   — epoch at which best_acc was achieved
+                best_loss        — lowest test_loss observed
+                best_loss_epoch  — epoch at which best_loss was achieved
+                final_train_acc  — train_acc at the last completed epoch
+                final_test_acc   — test_acc  at the last completed epoch
+                final_lr         — lr at the last completed epoch
+
+        Parameters
+        ----------
+        history : dict
+            Keys: 'train_loss', 'test_loss', 'train_acc', 'test_acc', 'lr'.
+            All lists must have the same length (= number of completed epochs).
         """
         n_epochs = len(history['train_loss'])
         if n_epochs == 0:
             return
 
-        # --- CSV: one row per epoch ---
+        train_acc = history['train_acc']
+        test_acc  = history['test_acc']
+
+        # ---- CSV --------------------------------------------------------
         df = pd.DataFrame({
-            'epoch': list(range(1, n_epochs + 1)),
+            'epoch':      list(range(1, n_epochs + 1)),
             'train_loss': history['train_loss'],
-            'test_loss': history['test_loss'],
-            'train_acc': [round(a, 6) for a in history['train_acc']],
-            'test_acc': [round(a, 6) for a in history['test_acc']],
-            'lr': history['lr'],
+            'test_loss':  history['test_loss'],
+            'train_acc':  train_acc,
+            'test_acc':   test_acc,
+            'lr':         history['lr'],
         })
         csv_path = os.path.join(self.exp_dir, 'training_history.csv')
         df.to_csv(csv_path, index=False)
+        self.info(f'Training history CSV saved -> {csv_path}')
 
-        # --- JSON summary ---
-        best_acc_idx = int(np.argmax(history['test_acc']))
+        # ---- JSON summary -----------------------------------------------
+        best_acc_idx  = int(np.argmax(test_acc))
         best_loss_idx = int(np.argmin(history['test_loss']))
+
         summary = {
-            'total_epochs': n_epochs,
-            'best_acc': round(history['test_acc'][best_acc_idx], 6),
-            'best_acc_epoch': best_acc_idx + 1,
-            'best_loss': round(history['test_loss'][best_loss_idx], 6),
+            'best_acc':        round(test_acc[best_acc_idx], 6),
+            'best_acc_epoch':  best_acc_idx + 1,
+            'best_loss':       round(history['test_loss'][best_loss_idx], 6),
             'best_loss_epoch': best_loss_idx + 1,
-            'final_train_acc': round(history['train_acc'][-1], 6),
-            'final_test_acc': round(history['test_acc'][-1], 6),
-            'final_lr': history['lr'][-1],
+            'final_train_acc': round(train_acc[-1], 6),
+            'final_test_acc':  round(test_acc[-1], 6),
+            'final_lr':        history['lr'][-1],
         }
         summary_path = os.path.join(self.exp_dir, 'training_summary.json')
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=4)
+        self.info(f'Training summary JSON saved -> {summary_path}')
 
     # ------------------------------------------------------------------
     # Training curve visualisation
@@ -189,28 +217,32 @@ class Logger:
             filename: str = 'training_curves.png',
     ) -> None:
         """
-        Plot training curves and save the figure.
+        Render and save the training curve figure.
 
-        Raw data is persisted first via save_history() so that
-        the CSV/JSON are written even if plotting fails.
+        Data persistence (CSV + JSON) is handled separately by
+        ``save_history()``.  This method only produces the PNG; call
+        ``save_history()`` first if you want both.
+
+        Figure layout (3 panels): Loss | Accuracy | Learning Rate
         """
-        # Persist raw data before plotting (decoupled: data is safe even if plot fails)
-        self.save_history(history)
-
-        out_dir = os.path.join(self.exp_dir, self.PLOTS_DIR)
+        out_dir   = os.path.join(self.exp_dir, self.PLOTS_DIR)
         os.makedirs(out_dir, exist_ok=True)
         save_path = os.path.join(out_dir, filename)
 
-        epochs = range(1, len(history['train_loss']) + 1)
+        epochs    = range(1, len(history['train_loss']) + 1)
+        train_pct = [a * 100 for a in history['train_acc']]
+        test_pct  = [a * 100 for a in history['test_acc']]
 
         fig = plt.figure(figsize=(15, 4))
         fig.suptitle(title, fontsize=13, fontweight='bold', y=1.01)
-        gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
+        gs  = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
 
-        # Loss
+        # ---- Panel 1: Loss ----
         ax1 = fig.add_subplot(gs[0])
-        ax1.plot(epochs, history['train_loss'], label='Train', color='steelblue', linewidth=1.5)
-        ax1.plot(epochs, history['test_loss'], label='Test', color='tomato', linewidth=1.5)
+        ax1.plot(epochs, history['train_loss'], label='Train',
+                 color='steelblue', linewidth=1.5)
+        ax1.plot(epochs, history['test_loss'],  label='Test',
+                 color='tomato',    linewidth=1.5)
         ax1.set_title('Loss')
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Loss')
@@ -218,22 +250,19 @@ class Logger:
         ax1.grid(True, linestyle='--', alpha=0.5)
         self._mark_best(ax1, epochs, history['test_loss'], mode='min', color='tomato')
 
-        # Accuracy
+        # ---- Panel 2: Accuracy ----
         ax2 = fig.add_subplot(gs[1])
-        train_pct = [a * 100 for a in history['train_acc']]
-        test_pct = [a * 100 for a in history['test_acc']]
         ax2.plot(epochs, train_pct, label='Train', color='steelblue', linewidth=1.5)
-        ax2.plot(epochs, test_pct, label='Test', color='tomato', linewidth=1.5)
-        ax2.set_title('Accuracy')
+        ax2.plot(epochs, test_pct,  label='Test',  color='tomato',    linewidth=1.5)
         ax2.set_xlabel('Epoch')
         ax2.set_ylabel('Acc (%)')
         ax2.legend()
         ax2.grid(True, linestyle='--', alpha=0.5)
         best_acc = self._mark_best(ax2, epochs, test_pct, mode='max', color='tomato')
-        if best_acc is not None:
-            ax2.set_title(f'Accuracy  (best: {best_acc:.2f}%)')
+        ax2.set_title(f'Accuracy  (best: {best_acc:.2f}%)' if best_acc is not None
+                      else 'Accuracy')
 
-        # Learning rate
+        # ---- Panel 3: Learning Rate ----
         ax3 = fig.add_subplot(gs[2])
         ax3.plot(epochs, history['lr'], color='mediumseagreen', linewidth=1.5)
         ax3.set_title('Learning Rate')
@@ -256,19 +285,19 @@ class Logger:
             title: str = 'Training Curves',
     ) -> None:
         """
-        Save a plot every `interval` epochs and keep the CSV in sync.
+        Save a plot every ``interval`` epochs and keep the CSV in sync.
 
         The CSV is overwritten on every call (always complete and resumable);
-        plots are generated only at multiples of `interval` to reduce I/O.
+        plots are generated only at multiples of ``interval`` to reduce I/O.
         """
-        # Always update CSV (available for real-time inspection)
+        # Always update CSV (available for real-time inspection).
         self.save_history(history)
 
-        # Generate plot only at the specified interval
+        # Generate plot only at the specified interval or on the final epoch.
         if epoch % interval == 0 or epoch == total_epochs:
             is_final = (epoch == total_epochs)
-            fname = 'training_curves.png' if is_final else f'training_curves_e{epoch:04d}.png'
-            # Call internal plot helper to avoid writing CSV a second time
+            fname = ('training_curves.png' if is_final
+                     else f'training_curves_e{epoch:04d}.png')
             self._plot_and_save(history, title=title, filename=fname)
 
     def _plot_and_save(
@@ -277,46 +306,38 @@ class Logger:
             title: str,
             filename: str,
     ) -> None:
-        """Plot and save without writing data (used internally by plot_training_realtime)."""
-        out_dir = os.path.join(self.exp_dir, self.PLOTS_DIR)
+        """Plot and save without writing data (used by plot_training_realtime)."""
+        out_dir   = os.path.join(self.exp_dir, self.PLOTS_DIR)
         os.makedirs(out_dir, exist_ok=True)
         save_path = os.path.join(out_dir, filename)
 
-        epochs = range(1, len(history['train_loss']) + 1)
+        epochs    = range(1, len(history['train_loss']) + 1)
+        train_pct = [a * 100 for a in history['train_acc']]
+        test_pct  = [a * 100 for a in history['test_acc']]
+
         fig = plt.figure(figsize=(15, 4))
         fig.suptitle(title, fontsize=13, fontweight='bold', y=1.01)
-        gs = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
+        gs  = gridspec.GridSpec(1, 3, figure=fig, wspace=0.35)
 
         ax1 = fig.add_subplot(gs[0])
         ax1.plot(epochs, history['train_loss'], label='Train', color='steelblue', linewidth=1.5)
-        ax1.plot(epochs, history['test_loss'], label='Test', color='tomato', linewidth=1.5)
-        ax1.set_title('Loss');
-        ax1.set_xlabel('Epoch');
-        ax1.set_ylabel('Loss')
-        ax1.legend();
-        ax1.grid(True, linestyle='--', alpha=0.5)
+        ax1.plot(epochs, history['test_loss'],  label='Test',  color='tomato',    linewidth=1.5)
+        ax1.set_title('Loss'); ax1.set_xlabel('Epoch'); ax1.set_ylabel('Loss')
+        ax1.legend(); ax1.grid(True, linestyle='--', alpha=0.5)
         self._mark_best(ax1, epochs, history['test_loss'], mode='min', color='tomato')
 
         ax2 = fig.add_subplot(gs[1])
-        train_pct = [a * 100 for a in history['train_acc']]
-        test_pct = [a * 100 for a in history['test_acc']]
         ax2.plot(epochs, train_pct, label='Train', color='steelblue', linewidth=1.5)
-        ax2.plot(epochs, test_pct, label='Test', color='tomato', linewidth=1.5)
+        ax2.plot(epochs, test_pct,  label='Test',  color='tomato',    linewidth=1.5)
         best_acc = self._mark_best(ax2, epochs, test_pct, mode='max', color='tomato')
-        title_acc = f'Accuracy  (best: {best_acc:.2f}%)' if best_acc else 'Accuracy'
-        ax2.set_title(title_acc);
-        ax2.set_xlabel('Epoch');
-        ax2.set_ylabel('Acc (%)')
-        ax2.legend();
-        ax2.grid(True, linestyle='--', alpha=0.5)
+        ax2.set_title(f'Accuracy  (best: {best_acc:.2f}%)' if best_acc else 'Accuracy')
+        ax2.set_xlabel('Epoch'); ax2.set_ylabel('Acc (%)')
+        ax2.legend(); ax2.grid(True, linestyle='--', alpha=0.5)
 
         ax3 = fig.add_subplot(gs[2])
         ax3.plot(epochs, history['lr'], color='mediumseagreen', linewidth=1.5)
-        ax3.set_title('Learning Rate');
-        ax3.set_xlabel('Epoch');
-        ax3.set_ylabel('LR')
-        ax3.set_yscale('log');
-        ax3.grid(True, linestyle='--', alpha=0.5)
+        ax3.set_title('Learning Rate'); ax3.set_xlabel('Epoch'); ax3.set_ylabel('LR')
+        ax3.set_yscale('log'); ax3.grid(True, linestyle='--', alpha=0.5)
 
         plt.tight_layout()
         fig.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -334,7 +355,7 @@ class Logger:
             return None
         best_idx = int(np.argmin(values) if mode == 'min' else np.argmax(values))
         best_val = values[best_idx]
-        best_ep = list(epochs)[best_idx]
+        best_ep  = list(epochs)[best_idx]
         ax.scatter(best_ep, best_val, color=color, zorder=5, marker='*', s=markersize ** 2)
         ax.annotate(
             f'{best_val:.3f}',

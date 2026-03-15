@@ -64,22 +64,96 @@ class Trainer:
         self.criterion = nn.CrossEntropyLoss().cuda()
         self.best_acc = 0.0
 
+        # Each list is appended once per epoch; indices are therefore
+        # 0-based epoch offsets.  All lists must stay in sync.
         self.history = {
-            'train_loss': [], 'test_loss': [],
-            'train_acc': [], 'test_acc': [],
-            'lr': [],
+            'train_loss': [],
+            'test_loss':  [],
+            'train_acc':  [],
+            'test_acc':   [],
+            'lr':         [],
         }
 
         flops, params = cal_flops_params(self.net, input_size=self._input_size(args.dataset))
         self.logger.info(f'FLOPs: {flops / 1e6:.2f}M, Params: {params / 1e6:.2f}M')
         self.logger.save_config(args)
 
+    # ------------------------------------------------------------------
+    # Output: data + curves + checkpoint
+    # ------------------------------------------------------------------
+
+    def _save_outputs(self, title: str) -> None:
+        """
+        Persist all training artefacts to disk.
+
+        Called from the ``finally`` block of ``run()`` — must never raise.
+        Each step runs in its own ``try/except`` so a failure in one cannot
+        affect the others.
+
+        Step order (intentional)
+        ------------------------
+        1. Raw data  — CSV + JSON via ``save_history()``.
+           This is the primary output: the source of truth for all future
+           visualisation and cross-model comparisons.  It runs first and
+           is fully independent of matplotlib.
+
+        2. Curve figure  — PNG via ``plot_training()``.
+           Secondary, convenience output for a quick visual check during
+           development.  Failure here never affects step 1.
+        """
+        if len(self.history['train_loss']) == 0:
+            self.logger.warning('_save_outputs: no epoch data to save (0 epochs completed).')
+            return
+
+        # ---- Step 1: raw data (CSV + JSON) — primary, must succeed ----
+        try:
+            self.logger.save_history(self.history)
+        except Exception as exc:
+            self.logger.error(f'Failed to save training data: {exc}')
+
+        # ---- Step 2: curve figure (PNG) — secondary, nice to have ----
+        try:
+            self.logger.plot_training(
+                self.history,
+                title=title,
+                filename='training_curves.png',
+            )
+        except Exception as exc:
+            self.logger.error(f'Failed to save training curves: {exc}')
+
+        # ---- Final summary log line ----
+        self.logger.info(f'--- Summary | Best Acc: {self.best_acc * 100:.2f}%')
+        self.logger.info(f'            | Best Err: {(1 - self.best_acc) * 100:.2f}%')
+
+    # ------------------------------------------------------------------
+    # Main training entry point
+    # ------------------------------------------------------------------
+
     def run(self) -> float:
-        args = self.args
-        total_epoch = args.total_epochs
+        """
+        Run the full training schedule and return the best test accuracy.
+
+        The epoch loop is wrapped in a try/except/finally block so that
+        training data and curves are always written to disk, even when
+        training is cut short by a KeyboardInterrupt or an unexpected
+        exception.
+
+        Interruption behaviour
+        ----------------------
+        KeyboardInterrupt
+            Caught and logged as a warning; training stops cleanly and
+            all data collected up to that point is saved.  The exception
+            is *not* re-raised, so the process exits normally.
+        Any other exception
+            Logged as an error and re-raised so the caller can inspect
+            the traceback.  The finally block still runs, so partial data
+            is saved before propagation.
+        """
+        args         = self.args
+        total_epoch  = args.total_epochs
         warmup_epoch = args.warmup_epochs
-        lr = args.lr
-        warmup_lr = args.warmup_lr
+        lr           = args.lr
+        warmup_lr    = args.warmup_lr
 
         optimizer = optim.SGD(
             self.net.parameters(),
@@ -92,46 +166,69 @@ class Trainer:
 
         w = len(str(total_epoch))
         prefix_w = 9 + w * 2
-        for epoch in range(total_epoch):
-            self.net.drop_connect_rate = args.drop_connect_rate * epoch / total_epoch
+        try:
+            for epoch in range(total_epoch):
+                self.net.drop_connect_rate = args.drop_connect_rate * epoch / total_epoch
 
-            if epoch < warmup_epoch:
-                cur_lr = warmup_lr + (lr - warmup_lr) / max(warmup_epoch - 1, 1) * epoch
-                for g in optimizer.param_groups:
-                    g['lr'] = cur_lr
-            else:
-                cur_lr = optimizer.param_groups[0]['lr']
+                # ---- Learning rate schedule ----
+                if epoch < warmup_epoch:
+                    cur_lr = warmup_lr + (lr - warmup_lr) / max(warmup_epoch - 1, 1) * epoch
+                    for g in optimizer.param_groups:
+                        g['lr'] = cur_lr
+                else:
+                    cur_lr = optimizer.param_groups[0]['lr']
 
-            self.logger.info(f'Epoch [{epoch + 1:>{w}d}/{total_epoch}] | LR: {cur_lr:.6f}')
-            self.history['lr'].append(cur_lr)
+                self.logger.info(f'Epoch [{epoch + 1:>{w}d}/{total_epoch}] | LR: {cur_lr:.6f}')
+                self.history['lr'].append(cur_lr)
 
-            t_loss, t_acc = self._train_epoch(optimizer)
-            self.history['train_loss'].append(t_loss)
-            self.history['train_acc'].append(t_acc)
-            self.logger.info(
-                f'{"Train":>{prefix_w}} | Loss: {t_loss:.4f} | Acc: {t_acc * 100:6.2f} %'
+                # ---- Train ----
+                t_loss, t_acc = self._train_epoch(optimizer)
+                self.history['train_loss'].append(t_loss)
+                self.history['train_acc'].append(t_acc)
+                self.logger.info(
+                    f'{"Train":>{prefix_w}} | Loss: {t_loss:.4f} | Acc: {t_acc * 100:6.2f} %'
+                )
+
+                if epoch >= warmup_epoch:
+                    scheduler.step()
+
+                # ---- Validate ----
+                v_loss, v_acc = self._validate()
+                self.history['test_loss'].append(v_loss)
+                self.history['test_acc'].append(v_acc)
+                self.logger.info(
+                    f'{"Test":>{prefix_w}} | Loss: {v_loss:.4f} | Acc: {v_acc * 100:6.2f} %'
+                )
+
+        except KeyboardInterrupt:
+            # Treat manual interruption as a clean (partial) completion.
+            completed = len(self.history['train_loss'])
+            self.logger.warning(
+                f'Training interrupted by user after epoch {completed}/{total_epoch}.  '
+                f'Saving collected data before exit.'
             )
 
-            if epoch >= warmup_epoch:
-                scheduler.step()
-
-            v_loss, v_acc = self._validate()
-            self.history['test_loss'].append(v_loss)
-            self.history['test_acc'].append(v_acc)
-            self.logger.info(
-                f'{"Test":>{prefix_w}} | Loss: {v_loss:.4f} | Acc: {v_acc * 100:6.2f} %'
+        except Exception as exc:
+            # Log and re-raise; the finally block still saves partial data.
+            completed = len(self.history['train_loss'])
+            self.logger.error(
+                f'Training failed at epoch {epoch + 1}/{total_epoch} '
+                f'({completed} epoch(s) completed): {exc}'
             )
+            raise
 
-        self.logger.plot_training(
-            self.history,
-            title=f'Training — {self.file_id}',
-            filename='training_curves.png',
-        )
-        self.logger.info(
-            f'Finished | Best Acc: {self.best_acc * 100:.2f}%  '
-            f'Best Err: {(1 - self.best_acc) * 100:.2f}%'
-        )
+        finally:
+            # Runs unconditionally: normal finish, KeyboardInterrupt, or
+            # any other exception.  Safe to call with 0 completed epochs.
+            self._save_outputs(title=f'Training - {self.file_id}')
+
         return self.best_acc
+
+
+
+    # ------------------------------------------------------------------
+    # Per-epoch train / validate
+    # ------------------------------------------------------------------
 
     def _train_epoch(self, optimizer):
         self.net.train()
@@ -151,7 +248,7 @@ class Trainer:
 
             running_loss += loss.item() * labels.size(0)
             _, pred = outputs.detach().max(1)
-            total += labels.size(0)
+            total   += labels.size(0)
             correct += pred.eq(labels).sum().item()
 
         return running_loss / total, correct / total
@@ -169,17 +266,23 @@ class Trainer:
                 loss = self.criterion(outputs, labels)
                 test_loss += loss.item() * labels.size(0)
                 _, pred = outputs.max(1)
-                total += labels.size(0)
+                total   += labels.size(0)
                 correct += pred.eq(labels).sum().item()
 
         acc = correct / total
         if acc > self.best_acc:
             os.makedirs('./trained_models', exist_ok=True)
-            torch.save(self.net.state_dict(),
-                       f'./trained_models/{self.file_id}_best.pt')
+            torch.save(
+                self.net.state_dict(),
+                f'./trained_models/{self.file_id}_best.pt',
+            )
             self.best_acc = acc
 
         return test_loss / total, acc
+
+    # ------------------------------------------------------------------
+    # Static helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _build_loaders(args):
@@ -241,11 +344,10 @@ class Runner:
             f'GPU#{gpu_id}  PID:{os.getpid()}  '
             f'Worker:{multiprocessing.current_process().name}'
         )
-        try:
-            trainer.run()
-        except Exception as e:
-            trainer.logger.error(f'Exception: {e}')
-            raise
+        # Trainer.run() manages its own try/except/finally.
+        # Non-KeyboardInterrupt exceptions are re-raised so subprocess-mode
+        # callers can detect failure via p.exitcode != 0.
+        trainer.run()
 
     @staticmethod
     def _ensure_dirs():

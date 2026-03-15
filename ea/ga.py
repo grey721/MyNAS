@@ -329,14 +329,15 @@ class Searcher:
         p2_fitness = self.evaluate(p2)
         self.log.info('Initial fitness evaluation complete.')
 
-        gen_info = f'GEN{0:>4} | '
+        w = len(str(self.generations))
+        gen_info = f'GEN [ {0:>{w}} / {self.generations} ] | '
         self._print_p1_p2_info(p1_fitness, p2_fitness, gen_info)
         self.log.plot_pop(p1_fitness, p2_fitness, generation=0)
 
         last_gen = 0  # Guard against generations=0 (variable i undefined).
         for i in range(1, self.generations + 1):
             last_gen = i
-            gen_info = f'GEN{i:>4} | '
+            gen_info = f'GEN [ {i:>{w}} / {self.generations} ] | '
 
             # Generate offspring.
             p1_off = self.reproduce(p1, p1_fitness[:, COL_FITNESS])

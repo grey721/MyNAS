@@ -1,54 +1,75 @@
 """
-example_arch code generator.
+example_arch static code generator (train phase).
 
-Responsibility
---------------
-Freeze a single chromosome (individual) into a complete Python source string
-that can be written to ``scripts/<n>/net.py`` and loaded directly by ``train.py``
-via ``importlib``, with no runtime dependency on the dynamic decode path.
+PURPOSE
+-------
+``generate_code()`` is the *optional* interface that enables *static save
+mode* in ``ResultSaver``.  When present, ``archs.has_codegen()`` returns
+``True`` and the search result package contains a frozen ``net.py`` with no
+runtime dependency on the ``archs`` package.
 
-Dynamic Net vs static net.py
-------------------------------
-    net.py (``Net`` class)              codegen.py (``generate_code``)
-    ----------------------------        -----------------------------------
-    Used during the search phase.       Used during the training phase.
-    ``Net(individual, dataset)``        ``Net(dropout, drop_connect_rate)``
-    Decodes the chromosome at runtime.  Architecture is hard-coded; no individual arg.
-    Depends on the archs package.       Only depends on archs.example_arch.modules (stable).
+STATIC vs DYNAMIC SAVE MODE
+-----------------------------
+::
 
-Generated code structure
-------------------------
-    # Auto-generated ... (header comment)
+                        Static  (has generate_code)   Dynamic  (no generate_code)
+    ──────────────────  ──────────────────────────    ──────────────────────────
+    Runtime dep on      archs.example_arch            archs.example_arch
+    archs package       modules only (stable)         net.Net (full decoder)
+    ──────────────────  ──────────────────────────    ──────────────────────────
+    Portability         High — ship net.py alone      Medium — needs archs pkg
+    ──────────────────  ──────────────────────────    ──────────────────────────
+    Decode logic        Frozen at search time          Always uses latest arch
+    ──────────────────  ──────────────────────────    ──────────────────────────
+    Maintenance cost    Must update codegen when Net   None
+                        changes
+
+Both modes expose the identical external signature to ``train.py``::
+
+    Net(dropout=0.0, drop_connect_rate=0.0)
+
+``ResultSaver._save_static`` writes the returned string to
+``scripts/<name>/net.py`` and generates a matching ``__init__.py``.
+
+DROPPATH HANDLING IN GENERATED CODE
+-------------------------------------
+``train.py`` updates ``net.drop_connect_rate`` every epoch.  The generated
+code stores the global rate as ``self.drop_connect_rate`` and each block
+call receives::
+
+    drop_connect_rate=drop_connect_rate * <coeff>
+
+where ``<coeff>`` is the block's pre-computed linear fraction
+``i / total_blocks``.  This matches the dynamic ``Net`` exactly.
+
+GENERATED FILE STRUCTURE
+-------------------------
+::
+
+    # Auto-generated header comment
     import statements
+
     class Net(nn.Module):
-        def __init__(self, dropout=0.2, drop_connect_rate=0.0):
-            self.stem    = ...   (hard-coded parameters)
+        def __init__(self, dropout=0.0, drop_connect_rate=0.0):
+            super().__init__()
+            self.stem    = ConvBnAct(...)
             self.blocks  = nn.Sequential(
-                CSBConvBlock(in_ch=..., out_ch=..., ...),  # block name comment
-                nn.Identity(),                              # skip block
+                MBConvBlock(...),   # stage_1_1
+                MBConvBlock(...),   # stage_1_2
                 ...
             )
-            self.head       = ...
-            self.classifier = ...
+            self.head    = nn.Sequential(...)
+            self.drop_connect_rate = drop_connect_rate
+            self.dropout    = nn.Dropout(...) if dropout > 0. else nn.Identity()
+            self.classifier = nn.Linear(...)
             init_weight(self)
-        def forward(self, x): ...
 
-Handling drop_connect_rate
----------------------------
-    ``train.py`` updates ``net.drop_connect_rate`` each epoch:
-        ``self.net.drop_connect_rate = args.drop_connect_rate * epoch / total_epoch``
-    Each block's actual DropPath rate must therefore be read dynamically in
-    ``forward``, not fixed at ``__init__`` time.
-    The generated code achieves this by storing each block's relative coefficient
-    ``dp_ratio`` at ``__init__`` and multiplying by ``self.drop_connect_rate`` in
-    ``forward``. This requires ``CSBConvBlock`` to accept ``drop_connect_rate`` in
-    its ``forward`` signature.
-
-    Simplified approach (current): DropPath rates are distributed linearly in
-    ``__init__`` using the initial ``drop_connect_rate``. The
-    ``net.drop_connect_rate`` attribute is preserved for API compatibility with
-    ``train.py`` but does not affect individual block rates after construction.
-    This matches the behaviour of the original NAS codebase.
+        def forward(self, x):
+            x = self.stem(x)
+            x = self.blocks(x)
+            x = self.head(x)
+            x = self.dropout(x)
+            return self.classifier(x)
 """
 
 from __future__ import annotations
@@ -58,152 +79,142 @@ from datetime import datetime
 
 import numpy as np
 
-from archs.example_arch.net.net import _DATASET_CFG, _make_divisible
+from archs.example_arch.modules.ops import make_divisible
+from archs.example_arch.net.net import _DATASET_CFG
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def generate_code(individual: np.ndarray, dataset: str) -> str:
     """
-    Freeze a chromosome into a complete ``net.py`` source string.
+    Freeze a chromosome into a complete, self-contained ``net.py`` source.
+
+    The returned string is PEP-8-compliant Python, importable as a module.
+    It depends only on ``archs.example_arch.modules`` and
+    ``template.func.init_weight`` — both stable, low-churn dependencies.
 
     Parameters
     ----------
-    individual:
-        Shape (num_blocks, 6); a single chromosome.
-    dataset:
-        Dataset name; determines stem / head configuration and number of classes.
+    individual : np.ndarray, shape (num_blocks, 4)
+        A single chromosome; each row is ``[e, k, se, f]``.
+    dataset : str
+        Must be a key in ``_DATASET_CFG``.
 
     Returns
     -------
     str
-        Full Python source code ready to be written to ``net.py``.
+        Complete Python source ready to write to ``net.py``.
 
     Raises
     ------
     ValueError
         If *dataset* is not supported.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from archs.example_arch.genotypes import get_search_space
+    >>> from archs.example_arch.net.population_initializer import initialize_population
+    >>> ss  = get_search_space('cifar10')
+    >>> pop = initialize_population(ss, pop_size=1)
+    >>> src = generate_code(pop[0], 'cifar10')
+    >>> 'class Net' in src and 'MBConvBlock' in src
+    True
     """
     if dataset not in _DATASET_CFG:
         raise ValueError(
-            f"generate_code: unsupported dataset {dataset!r}. "
-            f"Available: {list(_DATASET_CFG)}"
+            f"generate_code: unsupported dataset {dataset!r}.  "
+            f"Supported: {sorted(_DATASET_CFG)}"
         )
 
-    cfg = _DATASET_CFG[dataset]
-    num_classes = cfg['num_classes']
-    stem_stride = cfg['stem_stride']
-    stem_ch = cfg['stem_ch']
+    cfg         = _DATASET_CFG[dataset]
+    num_classes = cfg["num_classes"]
+    stem_stride = cfg["stem_stride"]
+    stem_ch     = cfg["stem_ch"]
+    head_ch     = cfg["head_ch"]
 
     from archs.example_arch.genotypes import get_search_space
     search_space = get_search_space(dataset)
-    names = search_space['names']
-    total_blocks = len(names)
+    names        = search_space["names"]
+    num_blocks   = len(names)
 
-    # ------------------------------------------------------------------
-    # 1. Decode chromosome block by block; emit block instantiation lines.
-    # ------------------------------------------------------------------
-    block_lines: list[str] = []
-    in_ch = stem_ch
+    # Decode chromosome → one source line per MBConvBlock constructor call.
+    block_lines, end_ch = _emit_block_lines(
+        individual, names, search_space, num_blocks, stem_ch,
+    )
+    blocks_src = "\n".join(block_lines)
 
-    for idx, name in enumerate(names):
-        gene = individual[idx]
-        s = float(gene[0])
-        e = int(gene[1])
-        b = int(gene[2])
-        k = int(gene[3])
-        se_ratio = float(gene[4])
-        f = float(gene[5])
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        base_ch = search_space[name][6][0]
-        stride = search_space[name][7]
-        out_ch = _make_divisible(base_ch * f)
-
-        # dp_ratio: this block's linear coefficient within [0, drop_connect_rate].
-        dp_ratio = idx / total_blocks
-
-        if s == 0 and stride == 1 and in_ch == out_ch:
-            block_lines.append(f'            nn.Identity(),                   # {name} (skip)')
-        else:
-            effective_s = max(s, 1.0) if s == 0 else s
-            block_lines.append(
-                f'            Block('
-                f'in_ch={in_ch}, out_ch={out_ch}, stride={stride}, '
-                f's={effective_s}, e={e}, b={b}, k={k}, '
-                f'se_ratio={se_ratio}, '
-                f'drop_connect_rate=drop_connect_rate * {dp_ratio:.6f}'
-                f'),  # {name}'
-            )
-
-        in_ch = out_ch
-
-    blocks_body = '\n'.join(block_lines)
-
-    # ------------------------------------------------------------------
-    # 2. Assemble the full source string.
-    # ------------------------------------------------------------------
-    code = textwrap.dedent(f'''\
+    code = textwrap.dedent(f"""\
         # =============================================================
-        # Auto-generated by NAS -- arch: example_arch, dataset: {dataset}
-        # Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        # Do NOT edit manually.
-        # To retrain: bash train.sh
-        # To inspect chromosome: chromosome.json
+        # Auto-generated by NAS framework
+        # Arch    : example_arch
+        # Dataset : {dataset}
+        # Created : {timestamp}
+        #
+        # DO NOT EDIT MANUALLY.
+        #   Retrain  : bash train.sh
+        #   Inspect  : chromosome.json
+        #   Regenerate: re-run search with the same chromosome
         # =============================================================
+
+        from __future__ import annotations
 
         import torch
         import torch.nn as nn
 
-        from archs.example_arch.modules import CSBConvBlock
+        from archs.example_arch.modules import ConvBnAct, MBConvBlock
         from template.func import init_weight
 
 
         class Net(nn.Module):
-            """
-            example_arch frozen network (auto-generated by NAS).
+            \"\"\"
+            example_arch frozen network — auto-generated by NAS.
+
+            All architecture parameters are hard-coded as literals.
+            No runtime dependency on the dynamic chromosome-decoder.
 
             Parameters
             ----------
-            dropout:
-                Classifier head dropout probability.
-            drop_connect_rate:
-                DropPath probability ceiling; train.py updates this attribute
-                dynamically each epoch.
-            """
+            dropout : float
+                Dropout probability before the classifier.
+            drop_connect_rate : float
+                Stored for API compatibility with ``train.py``'s epoch hook.
+                DropPath rates are fixed at construction time (linear schedule
+                from 0 to ``drop_connect_rate`` across blocks).
+            \"\"\"
 
             def __init__(
                 self,
-                dropout: float = 0.2,
+                dropout: float = 0.0,
                 drop_connect_rate: float = 0.0,
             ) -> None:
                 super().__init__()
 
-                # --- Stem ---
-                self.stem = nn.Sequential(
-                    nn.Conv2d(3, {stem_ch}, kernel_size=3, stride={stem_stride}, padding=1, bias=False),
-                    nn.BatchNorm2d({stem_ch}, eps=1e-3, momentum=0.01),
-                    nn.SiLU(),
-                )
+                # ── Stem ─────────────────────────────────────────────────
+                self.stem = ConvBnAct(3, {stem_ch}, kernel_size=3, stride={stem_stride})
 
-                # --- Blocks ({total_blocks} blocks, dataset={dataset}) ---
+                # ── Blocks ({num_blocks} blocks, dataset='{dataset}') ─────
                 self.blocks = nn.Sequential(
-        {blocks_body}
+        {blocks_src}
                 )
 
-                # --- Head ---
+                # ── Head ─────────────────────────────────────────────────
                 self.head = nn.Sequential(
-                    nn.Conv2d({in_ch}, 1280, kernel_size=1, bias=False),
-                    nn.BatchNorm2d(1280, eps=1e-3, momentum=0.01),
-                    nn.SiLU(),
+                    ConvBnAct({end_ch}, {head_ch}, kernel_size=1),
                     nn.AdaptiveAvgPool2d(1),
                     nn.Flatten(),
                 )
 
-                self.drop_connect_rate = drop_connect_rate  # updated by train.py each epoch
-                self.dropout    = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-                self.classifier = nn.Linear(1280, {num_classes})
+                # Preserved for train.py's per-epoch update hook.
+                self.drop_connect_rate = drop_connect_rate
+
+                self.dropout    = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
+                self.classifier = nn.Linear({head_ch}, {num_classes})
 
                 init_weight(self)
 
@@ -213,9 +224,69 @@ def generate_code(individual: np.ndarray, dataset: str) -> str:
                 x = self.head(x)
                 x = self.dropout(x)
                 return self.classifier(x)
-    ''')
+    """)
 
     return code
 
 
-__all__ = ['generate_code']
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _emit_block_lines(
+    individual: np.ndarray,
+    names: list[str],
+    search_space: dict,
+    num_blocks: int,
+    stem_ch: int,
+) -> tuple[list[str], int]:
+    """
+    Decode the chromosome and produce one source line per ``MBConvBlock``.
+
+    Parameters
+    ----------
+    individual : np.ndarray
+    names : list[str]
+    search_space : dict
+    num_blocks : int
+    stem_ch : int
+
+    Returns
+    -------
+    (lines, end_ch)
+        ``lines``  : list of strings, each an ``MBConvBlock(...)`` call
+                     indented for the ``nn.Sequential`` body (12-space indent).
+        ``end_ch`` : output channel count of the last block (for the head).
+    """
+    lines: list[str] = []
+    in_ch = stem_ch
+
+    for i, name in enumerate(names):
+        gene    = individual[i]
+        e       = int(gene[0])
+        k       = int(gene[1])
+        se      = float(gene[2])
+        f       = float(gene[3])
+
+        base_ch = search_space[name][4][0]
+        stride  = search_space[name][5]
+        out_ch  = make_divisible(base_ch * f)
+
+        # Linear drop-path coefficient: block 0 → 0.0, last block → 1.0.
+        coeff = i / num_blocks
+
+        lines.append(
+            f"            MBConvBlock("
+            f"in_ch={in_ch}, out_ch={out_ch}, stride={stride}, "
+            f"expansion_ratio={e}, kernel_size={k}, "
+            f"se_ratio={se!r}, "
+            f"drop_connect_rate=drop_connect_rate * {coeff:.6f}"
+            f"),  # {name}"
+        )
+        in_ch = out_ch
+
+    return lines, in_ch
+
+
+__all__ = ["generate_code"]
