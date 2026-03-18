@@ -70,8 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--random_seed', type=int, default=42)
 
     # --- Evolutionary hyperparameters ---
-    parser.add_argument('--p1_size', type=int, default=50)
-    parser.add_argument('--p2_size', type=int, default=50)
+    parser.add_argument('--p1_size', type=int, default=40)
+    parser.add_argument('--p2_size', type=int, default=40)
     parser.add_argument('--num_generations', type=int, default=50)
     parser.add_argument('--mutation_rate', type=float, default=0.2)
     parser.add_argument('--crossover_rate', type=float, default=0.8)

@@ -66,6 +66,16 @@ def plot_population(
 # ---------------------------------------------------------------------------
 # Population data persistence
 # ---------------------------------------------------------------------------
+class _NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
 
 def save_population_info(
         population: np.ndarray,
@@ -89,7 +99,7 @@ def save_population_info(
     records, arch_map = [], {}
 
     for i in range(pop_size):
-        arch_str = json.dumps(population[i].tolist(), separators=(',', ':'))
+        arch_str = json.dumps(population[i].tolist(), separators=(',', ':'), cls=_NumpyEncoder)
         arch_hash = hashlib.md5(arch_str.encode()).hexdigest()[:10]
         fitness, err, params, flops = fitness_matrix[i]
         records.append({

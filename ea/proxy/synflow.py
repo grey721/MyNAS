@@ -87,7 +87,7 @@ class SynFlow(BaseProxy):
         return score
 
     def __repr__(self) -> str:
-        return "SynFlowProxy()"
+        return "SynFlow()"
 
 
 __all__ = ['SynFlow']

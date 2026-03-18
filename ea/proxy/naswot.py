@@ -111,7 +111,7 @@ class NASWOT(BaseProxy):
         return _logdet(K_buf[0])
 
     def __repr__(self) -> str:
-        return f"NasWotProxy(batch_size={self.batch_size})"
+        return f"NASWOT(batch_size={self.batch_size})"
 
 
 __all__ = ['NASWOT']
